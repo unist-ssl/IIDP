@@ -1,0 +1,3802 @@
+diff --git a/torch/_C/_distributed_c10d.pyi b/torch/_C/_distributed_c10d.pyi
+index 8308907..fb73898 100644
+--- a/torch/_C/_distributed_c10d.pyi
++++ b/torch/_C/_distributed_c10d.pyi
+@@ -27,7 +27,10 @@ class _GradBucket:
+     def __init__(self, tensors: List[Tensor]): ...
+     def get_tensors(self) -> List[Tensor]: ...
+ 
+-class Reducer:
++
++def _register_iidp_comm_hook(reducer: IIDPReducer, state: Any, comm_hook: Any): ...
++
++class IIDPReducer:
+     def __init__(
+         self,
+         replicas: List[List[Tensor]],
+@@ -37,6 +40,23 @@ class Reducer:
+         bucket_bytes_cap: int,
+         find_unused_parameters: bool,
+         gradient_as_bucket_view: bool,
++        model_index: int,
++        num_local_models: int,
++        total_num_modles: int
++    ): ...
++    def initialize_buckets(self, bucket_indices: List[List[int]]): ...
++    ...
++
++class Reducer:
++    def __init__(
++        self,
++        replicas: List[List[Tensor]],
++        bucket_indices: List[List[int]],
++        process_group: ProcessGroup,
++        expect_sparse_gradients: List[List[bool]],
++        bucket_bytes_cap: int,
++        find_unused_parameters: bool,
++        gradient_as_bucket_view: bool
+     ): ...
+     def initialize_buckets(self, bucket_indices: List[List[int]]): ...
+     ...
+diff --git a/torch/autograd/__init__.py b/torch/autograd/__init__.py
+index a013c9e..cbac94e 100644
+--- a/torch/autograd/__init__.py
++++ b/torch/autograd/__init__.py
+@@ -72,6 +72,7 @@ def backward(
+     create_graph: bool = False,
+     grad_variables: Optional[_TensorOrTensors] = None,
+     inputs: Optional[Sequence[torch.Tensor]] = None,
++    model_index: int = None
+ ) -> None:
+     r"""Computes the sum of gradients of given tensors w.r.t. graph leaves.
+ 
+@@ -123,6 +124,7 @@ def backward(
+             used to compute the attr::tensors. All the provided inputs must be leaf
+             Tensors.
+     """
++
+     if grad_variables is not None:
+         warnings.warn("'grad_variables' is deprecated. Use 'grad_tensors' instead.")
+         if grad_tensors is None:
+@@ -133,6 +135,8 @@ def backward(
+                                "use 'grad_tensors'.")
+     if inputs is not None and len(inputs) == 0:
+         raise RuntimeError("'inputs' argument to backward() cannot be empty.")
++    if model_index is None:
++        raise RuntimeError("[IIDP] 'model_index' argument to backward() cannot be empty.")
+ 
+     tensors = (tensors,) if isinstance(tensors, torch.Tensor) else tuple(tensors)
+     inputs = tuple(inputs) if inputs is not None else tuple()
+@@ -144,7 +148,7 @@ def backward(
+ 
+     Variable._execution_engine.run_backward(
+         tensors, grad_tensors_, retain_graph, create_graph, inputs,
+-        allow_unreachable=True, accumulate_grad=True)  # allow_unreachable flag
++        allow_unreachable=True, accumulate_grad=True, model_index=model_index)  # allow_unreachable flag
+ 
+ 
+ def grad(
+@@ -154,7 +158,8 @@ def grad(
+     retain_graph: Optional[bool] = None,
+     create_graph: bool = False,
+     only_inputs: bool = True,
+-    allow_unused: bool = False
++    allow_unused: bool = False,
++    model_index: int = 0
+ ) -> Tuple[torch.Tensor, ...]:
+     r"""Computes and returns the sum of gradients of outputs w.r.t. the inputs.
+ 
+@@ -222,7 +227,7 @@ def grad(
+ 
+     return Variable._execution_engine.run_backward(
+         outputs, grad_outputs_, retain_graph, create_graph,
+-        inputs, allow_unused, accumulate_grad=False)
++        inputs, allow_unused, accumulate_grad=False, model_index=model_index)
+ 
+ 
+ # This function applies in case of gradient checkpointing for memory
+diff --git a/torch/csrc/autograd/autograd.cpp b/torch/csrc/autograd/autograd.cpp
+index e1e7058..556b216 100644
+--- a/torch/csrc/autograd/autograd.cpp
++++ b/torch/csrc/autograd/autograd.cpp
+@@ -69,7 +69,8 @@ variable_list run_backward(
+     bool create_graph,
+     const variable_list& inputs,
+     bool allow_unused,
+-    bool accumulate_grad) {
++    bool accumulate_grad,
++    int model_index) {
+   size_t num_tensors = outputs.size();
+   edge_list roots;
+   roots.reserve(num_tensors);
+@@ -132,12 +133,15 @@ void backward(
+     const variable_list& grad_tensors,
+     c10::optional<bool> retain_graph,
+     bool create_graph,
+-    const variable_list& inputs) {
++    const variable_list& inputs,
++    int model_index) {
+   variable_list gradients = _make_grads(tensors, grad_tensors);
+   if (!retain_graph) {
+     retain_graph = create_graph;
+   }
+-  run_backward(tensors, gradients, retain_graph.value(), create_graph, inputs, /*allow_unused=*/true, /*accumulate_grad=*/true);
++  run_backward(tensors, gradients, retain_graph.value(), create_graph, inputs,
++              /*allow_unused=*/true, /*accumulate_grad=*/true,
++              /*model_index=*/model_index);
+ }
+ 
+ variable_list grad(
+@@ -146,16 +150,16 @@ variable_list grad(
+     const variable_list& grad_outputs,
+     c10::optional<bool> retain_graph,
+     bool create_graph,
+-    bool allow_unused) {
++    bool allow_unused,
++    int model_index) {
+   variable_list gradients = _make_grads(outputs, grad_outputs);
+   if (!retain_graph) {
+     retain_graph = create_graph;
+   }
+   return run_backward(
+-    outputs, gradients, retain_graph.value(), create_graph, inputs, allow_unused, /*accumulate_grad=*/false);
++    outputs, gradients, retain_graph.value(), create_graph, inputs, allow_unused, /*accumulate_grad=*/false, model_index);
+ }
+ 
+-
+ namespace forward_ad {
+ 
+ uint64_t enter_dual_level() {
+diff --git a/torch/csrc/autograd/autograd.h b/torch/csrc/autograd/autograd.h
+index 7f905b2..3ce2465 100644
+--- a/torch/csrc/autograd/autograd.h
++++ b/torch/csrc/autograd/autograd.h
+@@ -41,7 +41,8 @@ TORCH_API void backward(
+     const variable_list& grad_tensors = {},
+     c10::optional<bool> retain_graph = c10::nullopt,
+     bool create_graph = false,
+-    const variable_list& inputs = {});
++    const variable_list& inputs = {},
++    int model_index = 0);
+ 
+ /// Computes and returns the sum of gradients of outputs with respect to the inputs.
+ ///
+@@ -73,7 +74,8 @@ TORCH_API variable_list grad(
+     const variable_list& grad_outputs = {},
+     c10::optional<bool> retain_graph = c10::nullopt,
+     bool create_graph = false,
+-    bool allow_unused = false);
++    bool allow_unused = false,
++    int model_index = 0);
+ 
+ namespace forward_ad {
+ 
+diff --git a/torch/csrc/autograd/engine.cpp b/torch/csrc/autograd/engine.cpp
+index af295fe..2429503 100644
+--- a/torch/csrc/autograd/engine.cpp
++++ b/torch/csrc/autograd/engine.cpp
+@@ -33,6 +33,7 @@
+ #include <sstream>
+ #include <queue>
+ #include <TH/TH.h>
++#include <vector>
+ 
+ namespace torch { namespace autograd {
+ 
+@@ -211,7 +212,8 @@ bool ReadyQueue::empty() const {
+   return heap_.empty();
+ }
+ 
+-Engine::Engine() : max_recursion_depth_(MAX_DEPTH), non_reentrant_device_thread_count_(0) {}
++Engine::Engine() : max_recursion_depth_(MAX_DEPTH), non_reentrant_device_thread_count_(0) {
++}
+ 
+ // Send shutdown tasks to all device_ready_queues_ if no backward tasks are running
+ // Even though readyQueue should be empty, shutdown tasks have the highest priority
+@@ -989,14 +991,29 @@ Engine& Engine::get_base_engine() {
+   return engine;
+ }
+ 
++Engine& Engine::get_base_engine_(int model_index) {
++  static Engine engine;
++  return engine;
++}
++
++
++std::vector<EngineStub> engine_stub_list;
+ std::atomic<EngineStub> engine_stub(Engine::get_base_engine);
++std::atomic<EngineStub_> engine_stub_(Engine::get_base_engine_);
+ 
+ void set_default_engine_stub(EngineStub stub) {
+   engine_stub.store(stub);
+ }
+ 
++void set_default_engine_stub(EngineStub_ stub) {
++  engine_stub_.store(stub);
++}
+ 
+ Engine& Engine::get_default_engine() {
++  TORCH_WARN_ONCE(
++    "get_default_engine() must not be called "
++    "if model is wrapped by ```torch.nn.parallel.IndependentIdenticalDataParallel```. "
++    "Please check if model is ```torch.nn.parallel.DistributedDataParallel```");
+   return engine_stub.load()();
+ }
+ 
+@@ -1101,6 +1118,7 @@ void Engine::add_thread_pool_task(const std::weak_ptr<GraphTask>& graph_task) {
+   thread_pool_shared_->graphtasks_queue_.push(graph_task);
+   // Don't need to be holding the lock while actually creating the thread
+   lck.unlock();
++
+   if (create_thread) {
+     std::thread t(&Engine::reentrant_thread_init, this);
+     t.detach();
+@@ -1180,3 +1198,4 @@ void GraphTask::init_to_execute(Node& graph_root, const edge_list& outputs, bool
+ }
+ 
+ }} // namespace torch::autograd
++
+diff --git a/torch/csrc/autograd/engine.h b/torch/csrc/autograd/engine.h
+index 7892f47..ab012fd 100644
+--- a/torch/csrc/autograd/engine.h
++++ b/torch/csrc/autograd/engine.h
+@@ -11,6 +11,7 @@
+ #include <torch/csrc/autograd/function.h>
+ #include <torch/csrc/autograd/functions/basic_ops.h>
+ #include <torch/csrc/autograd/input_buffer.h>
++#include <torch/csrc/python_headers.h>
+ 
+ #include <deque>
+ #include <exception>
+@@ -258,8 +259,8 @@ struct ReadyQueue {
+ struct TORCH_API Engine {
+   /// Returns a reference to a static `Engine` instance.
+   static Engine& get_default_engine();
+-
+   static Engine& get_base_engine();
++  static Engine& get_base_engine_(int model_index = 0);
+ 
+   Engine(const Engine&) = delete;
+   Engine(Engine&&) = delete;
+@@ -388,6 +389,8 @@ private:
+ 
+ // allow python_engine to override the default engine when it loads
+ using EngineStub = Engine& (*)();
++using EngineStub_ = Engine& (*)(int);
+ TORCH_API void set_default_engine_stub(EngineStub stub);
++TORCH_API void set_default_engine_stub(EngineStub_ stub);
+ 
+ }} // namespace torch::autograd
+diff --git a/torch/csrc/autograd/init.cpp b/torch/csrc/autograd/init.cpp
+index f3b23c6..03a8eea 100644
+--- a/torch/csrc/autograd/init.cpp
++++ b/torch/csrc/autograd/init.cpp
+@@ -1,5 +1,4 @@
+ #include <torch/csrc/python_headers.h>
+-
+ #include <c10/core/DeviceType.h>
+ #include <torch/csrc/Exceptions.h>
+ #include <torch/csrc/utils/pybind.h>
+@@ -12,6 +11,7 @@
+ #include <torch/csrc/autograd/utils/wrap_outputs.h>
+ #include <torch/csrc/autograd/utils/python_arg_parsing.h>
+ #include <torch/csrc/utils/pycfunction_helpers.h>
++#include <torch/csrc/autograd/python_engine.h>
+ 
+ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject *unused) {
+   using namespace torch::autograd::profiler;
+diff --git a/torch/csrc/autograd/python_engine.cpp b/torch/csrc/autograd/python_engine.cpp
+index 2b19536..fa738ef 100644
+--- a/torch/csrc/autograd/python_engine.cpp
++++ b/torch/csrc/autograd/python_engine.cpp
+@@ -18,6 +18,11 @@
+ 
+ #include <unordered_set>
+ #include <memory> // for unique_ptr
++#include <thread>
++#include <vector>
++#include <iostream>
++
++#define MAX_ENGINE_POOL 10
+ 
+ using namespace torch::autograd;
+ 
+@@ -31,21 +36,24 @@ namespace torch { namespace autograd { namespace python {
+ 
+ PythonEngine::PythonEngine() = default;
+ 
+-Engine& PythonEngine::get_python_engine() {
+-  static PythonEngine engine;
++Engine& PythonEngine::get_python_engine(int model_index) {
++  static PythonEngine engine[MAX_ENGINE_POOL];
++
+   // This is "probably" thread-safe because the flag is set in a fork handler
+   // before any threads are created, and this function is only called with the
+   // GIL held. However, using fork + threads is playing with fire so this is
+   // more of a "best effort" thing. For example, if the fork occurs while the
+   // backwards threads hold a lock, we'll probably deadlock in the engine
+   // destructor.
++
+   if (_reinitialize_engine) {
+-    engine.release_workers();
+-    engine.~PythonEngine();
+-    new (&engine) torch::autograd::python::PythonEngine();
++    engine[model_index].release_workers();
++    engine[model_index].~PythonEngine();
++    new (&engine[model_index]) torch::autograd::python::PythonEngine();
+     _reinitialize_engine = false;
+   }
+-  return engine;
++
++  return engine[model_index];
+ }
+ 
+ #if PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION >= 9
+@@ -147,13 +155,17 @@ PyObject *THPEngine_run_backward(PyObject *self, PyObject *args, PyObject *kwarg
+   PyObject *inputs = nullptr;
+   unsigned char allow_unreachable = 0;
+   unsigned char accumulate_grad = 0; // Indicate whether to accumulate grad into leaf Tensors or capture
++  int model_index;
++
++
+   const char *accepted_kwargs[] = { // NOLINT
+       "tensors", "grad_tensors", "keep_graph", "create_graph", "inputs",
+-      "allow_unreachable", "accumulate_grad", nullptr
++      "allow_unreachable", "accumulate_grad", "model_index", nullptr
+   };
+-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OObb|Obb", (char**)accepted_kwargs,
+-        &tensors, &grad_tensors, &keep_graph, &create_graph, &inputs, &allow_unreachable, &accumulate_grad))
++  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OObb|Obbi", (char**)accepted_kwargs,
++        &tensors, &grad_tensors, &keep_graph, &create_graph, &inputs, &allow_unreachable, &accumulate_grad, &model_index))
+     return nullptr;
++
+   THPUtils_assert(PyTuple_Check(tensors), "tensors argument is expected to "
+       "be a tuple, but got %s", THPUtils_typename(tensors));
+   THPUtils_assert(PyTuple_Check(grad_tensors), "grad_tensors argument is "
+@@ -247,7 +259,7 @@ PyObject *THPEngine_run_backward(PyObject *self, PyObject *args, PyObject *kwarg
+   variable_list outputs;
+   {
+     pybind11::gil_scoped_release no_gil;
+-    auto& engine = python::PythonEngine::get_python_engine();
++    auto& engine = python::PythonEngine::get_python_engine(model_index);
+     outputs = engine.execute(roots, grads, keep_graph, create_graph, accumulate_grad, output_edges);
+   }
+ 
+@@ -270,8 +282,20 @@ PyObject *THPEngine_run_backward(PyObject *self, PyObject *args, PyObject *kwarg
+ }
+ 
+ PyObject* THPEngine_queue_callback(PyObject *self, PyObject *_callback) {
++  // TODO(@IIDP): Update get_python_engine() to receive the model index as argument.
++  // However, queue_callback() funtion is currently not used in Python code
++  //TORCH_INTERNAL_ASSERT(false,
++  //    "queue_callback() funtion is currently supported "
++  //    "as it doesn't receive the model index as argument")
++  TORCH_WARN_ONCE(
++    "queue_callback() API is only supported for model index of 0. "
++    "TODO(@IIDP): Update get_python_engine() to receive the model index as argument");
++  // NOTE: [IIDP] For computation of GNS, pollux code uses queue_callback() API
++  // queue_callback() funtion is only supported for model index of 0
++  int model_index = 0;
+   HANDLE_TH_ERRORS
+-  auto& engine = python::PythonEngine::get_python_engine();
++  //auto& engine = python::PythonEngine::get_python_engine();
++  auto& engine = python::PythonEngine::get_python_engine(model_index);
+   std::shared_ptr<PyObject> callback(_callback, [](PyObject *obj) { pybind11::gil_scoped_acquire gil; Py_DECREF(obj); });
+   Py_INCREF(_callback);
+   engine.queue_callback([callback]() {
+diff --git a/torch/csrc/autograd/python_engine.h b/torch/csrc/autograd/python_engine.h
+index 3a54484..a5522f9 100644
+--- a/torch/csrc/autograd/python_engine.h
++++ b/torch/csrc/autograd/python_engine.h
+@@ -5,12 +5,14 @@
+ #include <torch/csrc/autograd/function.h>
+ #include <torch/csrc/autograd/engine.h>
+ 
++#include <vector>
++
+ bool THPEngine_initModule(PyObject *module);
+ 
+ namespace torch { namespace autograd { namespace python {
+ 
+ struct PythonEngine : public Engine {
+-  static Engine& get_python_engine();
++  static Engine& get_python_engine(int model_index = 0);
+   void thread_init(int device,
+       const std::shared_ptr<ReadyQueue>& ready_queue,
+       bool should_increment) override;
+diff --git a/torch/csrc/distributed/c10d/init.cpp b/torch/csrc/distributed/c10d/init.cpp
+index d733654..0883d0b 100644
+--- a/torch/csrc/distributed/c10d/init.cpp
++++ b/torch/csrc/distributed/c10d/init.cpp
+@@ -130,6 +130,16 @@ class PythonStore : public ::c10d::Store {
+   }
+ };
+ 
++void _register_iidp_comm_hook(
++    ::c10d::IIDPReducer& reducer,
++    py::object state,
++    py::object comm_hook) {
++  reducer.register_comm_hook(std::make_unique<::c10d::PythonCommHook>(
++      std::move(state), std::move(comm_hook)));
++}
++
++// == Original DDP ==
++
+ // Called from DDP's Python API to create a c10d Python comm hook object.
+ // The input state and callable comm_hook are Python objects. It later calls
+ // register_comm_hook function of the reducer input to register the hook.
+@@ -202,7 +212,36 @@ PyObject* c10d_init(PyObject* _unused, PyObject* noargs) {
+           [](::c10d::Reducer& reducer) -> c10::DDPLoggingData {
+             return reducer.get_ddp_logging_data();
+           },
+-          py::arg("reducer"));
++          py::arg("reducer")) // ; original DDP
++      .def(
++          "_set_construction_logging_data",
++          [](
++              ::c10d::IIDPReducer& reducer,
++              const std::string& module_name,
++              const std::vector<int>& device_ids,
++              int output_device,
++              bool broadcast_buffers) -> void {
++            reducer.set_construction_logging_data(
++                module_name, device_ids, output_device, broadcast_buffers);
++          },
++          py::arg("reducer"),
++          py::arg("module_name"),
++          py::arg("device_ids"),
++          py::arg("output_device"),
++          py::arg("broadcast_buffers"))
++      .def(
++          "_get_ddp_logging_data",
++          [](::c10d::IIDPReducer& reducer) -> c10::DDPLoggingData {
++            return reducer.get_ddp_logging_data();
++          },
++          py::arg("reducer"))
++      .def(
++          "_register_iidp_comm_hook",
++          &_register_iidp_comm_hook,
++          py::arg("reducer"),
++          py::arg("state"),
++          py::arg("comm_hook"),
++          py::call_guard<py::gil_scoped_release>());
+ 
+   shared_ptr_class_<::c10d::GradBucket>(module, "_GradBucket")
+       .def(
+@@ -243,8 +282,77 @@ PyObject* c10d_init(PyObject* _unused, PyObject* noargs) {
+       .def(
+           "get_sizes_list",
+           &::c10d::GradBucket::getSizesVec,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "get_gradients",
++          &::c10d::GradBucket::getGradients,
+           py::call_guard<py::gil_scoped_release>());
+ 
++  shared_ptr_class_<::c10d::IIDPReducer>(module, "IIDPReducer")
++      .def(
++          py::init<
++              std::vector<std::vector<torch::autograd::Variable>>,
++              std::vector<std::vector<size_t>>,
++              c10::intrusive_ptr<::c10d::ProcessGroup>,
++              std::vector<std::vector<bool>>,
++              int64_t,
++              bool,
++              bool,
++              int,
++              int,
++              int>(),
++          py::arg("replicas"),
++          py::arg("bucket_indices"),
++          py::arg("process_group"),
++          py::arg("expect_sparse_gradients") = std::vector<std::vector<bool>>(),
++          py::arg("bucket_bytes_cap") = ::c10d::kDefaultBucketBytesCap,
++          py::arg("find_unused_parameters") = false,
++          py::arg("gradient_as_bucket_view") = false,
++          py::arg("model_index"),
++          py::arg("num_local_models"),
++          py::arg("total_num_models"),
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "initialize_buckets",
++          &::c10d::IIDPReducer::initialize_buckets,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "prepare_for_backward",
++          &::c10d::IIDPReducer::prepare_for_backward,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "prepare_for_backward",
++          [](::c10d::IIDPReducer& reducer, const torch::autograd::Variable& output)
++              -> void { reducer.prepare_for_backward({output}); },
++          py::call_guard<py::gil_scoped_release>())
++      .def("get_backward_stats", &::c10d::IIDPReducer::get_backward_stats)
++      .def(
++          "_rebuild_buckets",
++          &::c10d::IIDPReducer::rebuild_buckets,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "get_bucket_tensors",
++          &::c10d::IIDPReducer::get_bucket_tensors,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "_push_all_rebuilt_params",
++          &::c10d::IIDPReducer::push_rebuilt_params_for_all_indices,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "_set_forward_pass_work_handle",
++          &::c10d::IIDPReducer::set_forward_pass_work_handle,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "reconfigure",
++          &::c10d::IIDPReducer::reconfigure,
++          py::call_guard<py::gil_scoped_release>())
++      .def(
++          "_get_local_used_maps",
++          &::c10d::IIDPReducer::get_local_used_maps_on_device)
++      .def("get_rebuilt_bucket_indices", &::c10d::IIDPReducer::get_rebuilt_bucket_indices);
++
++// == Original DDP ==
++
+   py::enum_<::c10d::BuiltinCommHookType>(module, "BuiltinCommHookType", R"(
+ An enum-like class for built-in communication hooks: ``ALLREDUCE`` and ``FP16_COMPRESS``.)")
+       .value("ALLREDUCE", ::c10d::BuiltinCommHookType::ALLREDUCE)
+diff --git a/torch/distributed/__init__.py b/torch/distributed/__init__.py
+index 7fe880c..6419c2a 100644
+--- a/torch/distributed/__init__.py
++++ b/torch/distributed/__init__.py
+@@ -26,11 +26,13 @@ if is_available():
+         TCPStore,
+         ProcessGroup,
+         Reducer,
++        IIDPReducer,
+         BuiltinCommHookType,
+         _DEFAULT_FIRST_BUCKET_BYTES,
+         _GradBucket,
+         _register_comm_hook,
+         _register_builtin_comm_hook,
++        _register_iidp_comm_hook,
+         _broadcast_coalesced,
+         _compute_bucket_assignment_by_size,
+         _test_python_store,
+diff --git a/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py b/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py
+index 88c69ed..1be5175 100644
+--- a/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py
++++ b/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py
+@@ -2,6 +2,25 @@ import torch
+ import torch.distributed as dist
+ 
+ 
++def _allreduce_sum_fut(
++    process_group: dist.ProcessGroup, tensor: torch.Tensor
++) -> torch.futures.Future:
++    group_to_use = process_group if process_group is not None else dist.group.WORLD
++    fut = dist.all_reduce(tensor, group=group_to_use, async_op=True).get_future()
++
++    def get_value(fut):
++        # print(f'[DEBUG] _allreduce_sum_fut: {fut.value()[0]}')
++        return [fut.value()[0]]
++
++    return fut.then(get_value)
++
++
++def allreduce_sum_hook(
++    process_group: dist.ProcessGroup, bucket: dist._GradBucket
++) -> torch.futures.Future:
++    return _allreduce_sum_fut(process_group, bucket.get_tensors()[0])
++
++
+ def _allreduce_fut(
+     process_group: dist.ProcessGroup, tensor: torch.Tensor
+ ) -> torch.futures.Future:
+diff --git a/torch/lib/c10d/ProcessGroup.hpp b/torch/lib/c10d/ProcessGroup.hpp
+index d8ec4b3..47b838d 100644
+--- a/torch/lib/c10d/ProcessGroup.hpp
++++ b/torch/lib/c10d/ProcessGroup.hpp
+@@ -192,6 +192,9 @@ class ProcessGroup : public torch::CustomClassHolder {
+       std::vector<at::Tensor>& tensors,
+       const ReduceOptions& opts = ReduceOptions()) = 0;
+ 
++  virtual c10::intrusive_ptr<ProcessGroup::Work> get_dummy_work(
++      std::vector<at::Tensor>& tensors) = 0;
++
+   virtual c10::intrusive_ptr<ProcessGroup::Work> allgather(
+       std::vector<std::vector<at::Tensor>>& outputTensors,
+       std::vector<at::Tensor>& inputTensors,
+diff --git a/torch/lib/c10d/ProcessGroupGloo.cpp b/torch/lib/c10d/ProcessGroupGloo.cpp
+index f8cc380..51bf146 100644
+--- a/torch/lib/c10d/ProcessGroupGloo.cpp
++++ b/torch/lib/c10d/ProcessGroupGloo.cpp
+@@ -1363,6 +1363,12 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupGloo::allreduce(
+   return work;
+ }
+ 
++c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupGloo::get_dummy_work(
++        std::vector<at::Tensor>& tensors) {
++  c10::intrusive_ptr<AsyncWork> dummy;
++  return dummy;
++}
++
+ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupGloo::allreduce_coalesced(
+     std::vector<at::Tensor>& tensors,
+     const AllreduceCoalescedOptions& opts) {
+diff --git a/torch/lib/c10d/ProcessGroupGloo.hpp b/torch/lib/c10d/ProcessGroupGloo.hpp
+index d0befc9..870a6b4 100644
+--- a/torch/lib/c10d/ProcessGroupGloo.hpp
++++ b/torch/lib/c10d/ProcessGroupGloo.hpp
+@@ -169,6 +169,9 @@ class ProcessGroupGloo : public ProcessGroup {
+       std::vector<at::Tensor>& tensors,
+       const BroadcastOptions& opts = BroadcastOptions()) override;
+ 
++  c10::intrusive_ptr<ProcessGroup::Work> get_dummy_work(
++      std::vector<at::Tensor>& tensors) override;
++
+   c10::intrusive_ptr<ProcessGroup::Work> allreduce(
+       std::vector<at::Tensor>& tensors,
+       const AllreduceOptions& opts = AllreduceOptions()) override;
+diff --git a/torch/lib/c10d/ProcessGroupMPI.cpp b/torch/lib/c10d/ProcessGroupMPI.cpp
+index 250b635..f1c00f5 100644
+--- a/torch/lib/c10d/ProcessGroupMPI.cpp
++++ b/torch/lib/c10d/ProcessGroupMPI.cpp
+@@ -339,6 +339,20 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::broadcast(
+   return enqueue(std::move(entry));
+ }
+ 
++c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::get_dummy_work(
++    std::vector<at::Tensor>& tensors) {
++
++  std::function<void(std::unique_ptr<WorkEntry>&)> doNothing =
++    [this](std::unique_ptr<WorkEntry>& entry) {
++      auto data = (entry->src)[0];
++    };
++
++  auto entry = std::unique_ptr<WorkEntry>(
++      new WorkEntry(&tensors, nullptr, std::move(doNothing)));
++  return enqueue(std::move(entry));
++}
++
++
+ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::allreduce(
+     std::vector<at::Tensor>& tensors,
+     const AllreduceOptions& opts) {
+diff --git a/torch/lib/c10d/ProcessGroupMPI.hpp b/torch/lib/c10d/ProcessGroupMPI.hpp
+index 4e5b7f5..4c660c5 100644
+--- a/torch/lib/c10d/ProcessGroupMPI.hpp
++++ b/torch/lib/c10d/ProcessGroupMPI.hpp
+@@ -122,6 +122,9 @@ class ProcessGroupMPI : public ProcessGroup {
+       std::vector<at::Tensor>& tensors,
+       const AllreduceOptions& opts = AllreduceOptions()) override;
+ 
++  c10::intrusive_ptr<ProcessGroup::Work> get_dummy_work(
++      std::vector<at::Tensor>& tensors) override;
++
+   c10::intrusive_ptr<ProcessGroup::Work> allreduce_coalesced(
+       std::vector<at::Tensor>& tensors,
+       const AllreduceCoalescedOptions& opts =
+diff --git a/torch/lib/c10d/ProcessGroupNCCL.cpp b/torch/lib/c10d/ProcessGroupNCCL.cpp
+index 19bcb67..2e9a2de 100644
+--- a/torch/lib/c10d/ProcessGroupNCCL.cpp
++++ b/torch/lib/c10d/ProcessGroupNCCL.cpp
+@@ -1180,6 +1180,16 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupNCCL::pointToPoint(
+       [](std::vector<at::cuda::CUDAStream>&) {});
+ }
+ 
++c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupNCCL::get_dummy_work(
++    std::vector<at::Tensor>& tensors) {
++
++  const auto& devices = getDeviceList(tensors);
++  auto dummy_work = c10::make_intrusive<ProcessGroupNCCL::WorkNCCL>(devices, rank_, OpType::ALLREDUCE, "nccl:dummy_work");
++  dummy_work->outputs_ = std::make_shared<std::vector<at::Tensor>>(tensors);
++  return dummy_work;
++}
++
++
+ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupNCCL::allreduce(
+     std::vector<at::Tensor>& tensors,
+     const AllreduceOptions& opts) {
+diff --git a/torch/lib/c10d/ProcessGroupNCCL.hpp b/torch/lib/c10d/ProcessGroupNCCL.hpp
+index bc47b06..08c84a7 100644
+--- a/torch/lib/c10d/ProcessGroupNCCL.hpp
++++ b/torch/lib/c10d/ProcessGroupNCCL.hpp
+@@ -237,6 +237,9 @@ class ProcessGroupNCCL : public ProcessGroup {
+       std::vector<at::Tensor>& tensors,
+       const BroadcastOptions& opts = BroadcastOptions()) override;
+ 
++  c10::intrusive_ptr<ProcessGroup::Work> get_dummy_work(
++      std::vector<at::Tensor>& tensors) override;
++
+   c10::intrusive_ptr<ProcessGroup::Work> allreduce(
+       std::vector<at::Tensor>& tensors,
+       const AllreduceOptions& opts = AllreduceOptions()) override;
+diff --git a/torch/lib/c10d/ProcessGroupRoundRobin.cpp b/torch/lib/c10d/ProcessGroupRoundRobin.cpp
+index 455c165..e2eda0d 100644
+--- a/torch/lib/c10d/ProcessGroupRoundRobin.cpp
++++ b/torch/lib/c10d/ProcessGroupRoundRobin.cpp
+@@ -17,6 +17,12 @@ ProcessGroupRoundRobin::ProcessGroupRoundRobin(
+ 
+ ProcessGroupRoundRobin::~ProcessGroupRoundRobin() {}
+ 
++c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupRoundRobin::get_dummy_work(
++        std::vector<at::Tensor>& tensors) {
++  auto dummy = c10::make_intrusive<ProcessGroup::Work>();
++  return dummy;
++}
++
+ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupRoundRobin::broadcast(
+     std::vector<at::Tensor>& tensors,
+     const BroadcastOptions& opts) {
+diff --git a/torch/lib/c10d/ProcessGroupRoundRobin.hpp b/torch/lib/c10d/ProcessGroupRoundRobin.hpp
+index 6ce7a78..716a0c4 100644
+--- a/torch/lib/c10d/ProcessGroupRoundRobin.hpp
++++ b/torch/lib/c10d/ProcessGroupRoundRobin.hpp
+@@ -35,6 +35,9 @@ class ProcessGroupRoundRobin final : public ProcessGroup {
+       std::vector<at::Tensor>& tensors,
+       const BroadcastOptions& opts = BroadcastOptions()) override;
+ 
++  c10::intrusive_ptr<ProcessGroup::Work> get_dummy_work(
++      std::vector<at::Tensor>& tensors) override;
++
+   c10::intrusive_ptr<ProcessGroup::Work> allreduce(
+       std::vector<at::Tensor>& tensors,
+       const AllreduceOptions& opts = AllreduceOptions()) override;
+diff --git a/torch/lib/c10d/comm.cpp b/torch/lib/c10d/comm.cpp
+index 1db8901..1acc582 100644
+--- a/torch/lib/c10d/comm.cpp
++++ b/torch/lib/c10d/comm.cpp
+@@ -3,6 +3,7 @@
+ #include <deque>
+ 
+ #include <ATen/core/functional.h>
++#include <c10/util/irange.h>
+ #include <c10d/reducer.hpp>
+ #include <torch/csrc/jit/python/pybind_utils.h>
+ #include <torch/csrc/utils/tensor_flatten.h>
+@@ -87,4 +88,16 @@ void broadcast_coalesced(
+   }
+ }
+ 
++std::vector<at::Tensor> GradBucket::getGradients() const {
++  std::vector<at::Tensor> per_parameter_tensors;
++  size_t num_parameters = offsets_.size();
++  per_parameter_tensors.reserve(num_parameters);
++  for (const auto i : c10::irange(num_parameters)) {
++    per_parameter_tensors.push_back(
++        tensors_[0].slice(0, offsets_[i], offsets_[i] + lengths_[i])
++            .view(sizes_vec_[i]));
++  }
++  return per_parameter_tensors;
++}
++
+ } // namespace c10d
+diff --git a/torch/lib/c10d/comm.hpp b/torch/lib/c10d/comm.hpp
+index 3a39bac..a9a3159 100644
+--- a/torch/lib/c10d/comm.hpp
++++ b/torch/lib/c10d/comm.hpp
+@@ -65,6 +65,10 @@ class GradBucket {
+     return sizes_vec_;
+   }
+ 
++  // Each tensor in the list that getGradients corresponds to a
++  // parameter.
++  std::vector<at::Tensor> getGradients() const;
++
+  private:
+   size_t index_;
+   std::vector<at::Tensor> tensors_;
+diff --git a/torch/lib/c10d/reducer.cpp b/torch/lib/c10d/reducer.cpp
+index 741e60b..cc23d74 100644
+--- a/torch/lib/c10d/reducer.cpp
++++ b/torch/lib/c10d/reducer.cpp
+@@ -15,17 +15,1642 @@
+ #include <torch/csrc/autograd/utils/lambda_post_hook.h>
+ #include <torch/csrc/utils/memory.h>
+ 
++#include <torch/csrc/autograd/python_engine.h>
++
++#include <mutex>
++#include <condition_variable>
++#include <thread>
++#include <chrono>
++#include <unistd.h>
++
++#include <ATen/cuda/CUDAContext.h>
++
+ namespace c10d {
+ namespace {
+ 
+-inline int64_t current_time_in_nanos() {
+-  return torch::autograd::profiler::getTime();
++inline int64_t current_time_in_nanos() {
++  return torch::autograd::profiler::getTime();
++}
++
++constexpr int kUnsetDivFactor = -1;
++
++} // namespace
++
++
++// [IIDP] Data structures for local gradient aggregation
++std::vector<IIDPReducer*> IIDPReducer::reducer_list;
++std::vector<std::vector<bool>> IIDPReducer::bucket_checker;
++
++Barrier IIDPReducer::barrier(0);
++std::mutex IIDPReducer::barrier_init_mutex;
++std::condition_variable IIDPReducer::barrier_init_condition;
++
++
++IIDPReducer::IIDPReducer(
++    std::vector<std::vector<torch::autograd::Variable>> replicas,
++    std::vector<std::vector<size_t>> bucket_indices,
++    c10::intrusive_ptr<c10d::ProcessGroup> process_group,
++    std::vector<std::vector<bool>> expect_sparse_gradients,
++    int64_t bucket_bytes_cap,
++    bool find_unused_parameters,
++    bool gradient_as_bucket_view,
++    int model_index,
++    int num_local_models,
++    int total_num_models)
++    : replicas_(std::move(replicas)),
++      process_group_(std::move(process_group)),
++      expect_sparse_gradients_(std::move(expect_sparse_gradients)),
++      expect_autograd_hooks_(false),
++      require_finalize_(false),
++      next_bucket_(0),
++      has_marked_unused_parameters_(false),
++      find_unused_parameters_(find_unused_parameters),
++      gradient_as_bucket_view_(gradient_as_bucket_view),
++      model_index_(model_index),
++      num_local_models_(num_local_models),
++      total_num_models_(total_num_models),
++      local_used_maps_reduced_(false),
++      backward_stats_base_(0),
++      has_rebuilt_bucket_(false),
++      bucket_bytes_cap_(bucket_bytes_cap),
++      divFactor_(kUnsetDivFactor),
++      comm_hook_(nullptr),
++      ddp_logging_data_(std::move(std::make_unique<c10::DDPLoggingData>())) {
++  C10_LOG_API_USAGE_ONCE("torch.distributed.ddp.reducer");
++  TORCH_CHECK(replicas_.size() >= 1, "Expected at least one model replica.");
++  TORCH_CHECK(replicas_[0].size() >= 1, "Expected at least one parameter.");
++
++  if (model_index_ == 0 && process_group_->getRank() == 0) {
++    std::cout << "======================================================" << std::endl;
++    std::cout << "[INFO][torch/lib/c10d/reducer.cpp]" << std::endl;
++    std::cout << "Number of local models (VSWs) on GPU: " << num_local_models << std::endl;
++    std::cout << "Number of total models (VSWs x GA step x world size): " << total_num_models << std::endl;
++    std::cout << "[INFO] gradient_as_bucket_view_: " << gradient_as_bucket_view_ << std::endl;
++    std::cout << "======================================================" << std::endl;
++  }
++
++  int num_buckets = bucket_indices.size();
++
++  // If `expect_sparse_gradients` is not specified, initialize it such that
++  // we do not expect sparse gradients for any parameter.
++  if (expect_sparse_gradients_.empty()) {
++    expect_sparse_gradients_ = std::vector<std::vector<bool>>(
++        replicas_.size(), std::vector<bool>(replicas_[0].size(), false));
++  }
++  TORCH_INTERNAL_ASSERT(expect_sparse_gradients_.size() == replicas_.size());
++
++  // Corresponding params' layouts (strides) must match across
++  // replicas within this process and across processes.
++  // (see Note:  "Gradient Layout Contract" in initialize_buckets).
++  verify_replicas_within_process();
++
++  if (model_index_ == 0) {
++    verify_replica0_across_processes();
++  }
++
++  // Initialize variable bucketing.
++  // This can be reinitialized later after capturing runtime information.
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    initialize_buckets(std::move(bucket_indices));
++  }
++
++  // All variables are expected to have their `grad_fn` set to the gradient
++  // accumulation function (since they are leafs in the autograd graph).
++  // We store pointers to these functions such that we can check if they are
++  // used in an autograd pass. If they are not, we know their grad tensors
++  // can be marked as ready for reduction.
++  {
++    const auto replica_count = replicas_.size();
++    if (model_index_ == 0 && process_group_->getRank() == 0) {
++      std::cout << "[INFO][torch/lib/c10d/reducer.cpp] replica count: "
++                << replica_count << std::endl;
++    }
++    grad_accumulators_.resize(replica_count);
++    for (size_t replica_index = 0; replica_index < replica_count;
++         replica_index++) {
++      const auto variable_count = replicas_[replica_index].size();
++      if (model_index_ == 0 && process_group_->getRank() == 0) {
++        std::cout << "[INFO][torch/lib/c10d/reducer.cpp] variable count: "
++                  << variable_count << std::endl;
++      }
++      grad_accumulators_[replica_index].resize(variable_count);
++      for (size_t variable_index = 0; variable_index < variable_count;
++           variable_index++) {
++        auto& variable = replicas_[replica_index][variable_index];
++        const auto index = VariableIndex(replica_index, variable_index);
++
++        // The gradient accumulator function is lazily initialized once.
++        // Therefore we can use its presence in the autograd graph as
++        // evidence that the parameter has participated in an iteration.
++        auto grad_accumulator =
++            torch::autograd::impl::grad_accumulator(variable);
++
++#ifndef _WIN32
++        using torch::distributed::autograd::ThreadLocalDistAutogradContext;
++#endif
++        // Hook to execute after the gradient accumulator has executed.
++        hooks_.emplace_back(
++            grad_accumulator->add_post_hook(
++                torch::make_unique<torch::autograd::utils::LambdaPostHook>(
++                    [=](const torch::autograd::variable_list& outputs,
++                        const torch::autograd::variable_list& /* unused */) {
++#ifndef _WIN32
++                      this->rpc_context_.set(
++                          ThreadLocalDistAutogradContext::getContextPtr());
++#endif
++                      this->autograd_hook(index);
++                      return outputs;
++                    })),
++            grad_accumulator);
++
++        // Map raw function pointer to replica index and parameter index.
++        // This is used later on when the autograd graph is traversed
++        // to check for parameters for which no gradient is computed, if
++        // find_unused_parameters=True.
++        // We maintain a mapping of gradient accumulator to vector of variables,
++        // since multiple parameters may share the same grad accumulator.
++        if (find_unused_parameters_) {
++          auto gradAcc = gradAccToVariablesMap_.find(grad_accumulator.get());
++          if (gradAcc == gradAccToVariablesMap_.end()) {
++            std::vector<VariableIndex> indexVec{index};
++            gradAccToVariablesMap_[grad_accumulator.get()] =
++                std::move(indexVec);
++          } else {
++            // Scenario where we have indices whose corresponding parameters
++            // share the same grad accumulator.
++            gradAcc->second.push_back(index);
++          }
++        }
++
++        // The gradient accumulator is stored as weak_ptr in the autograd
++        // metadata of the variable, so we have to keep it alive here for
++        // the raw pointer to be valid.
++        grad_accumulators_[replica_index][variable_index] =
++            std::move(grad_accumulator);
++      }
++    }
++  }
++
++  // Initialize backward stats vector.
++  {
++    const auto replica_count = replicas_.size();
++    backward_stats_.resize(replica_count);
++    const auto variable_count = replicas_[0].size();
++    std::for_each(
++        backward_stats_.begin(),
++        backward_stats_.end(),
++        [=](std::vector<int64_t>& v) { v.resize(variable_count); });
++  }
++
++  // See Note [Skip allreducing local_used_maps_dev]
++  if (find_unused_parameters_) {
++    // Initialize locally used parameter maps
++    {
++      const auto replica_count = replicas_.size();
++      const auto variable_count = replicas_[0].size();
++      local_used_maps_.resize(replica_count);
++      local_used_maps_dev_.resize(replica_count);
++
++      for (size_t i = 0; i < replica_count; i++) {
++        at::TensorOptions options;
++        options = options.dtype(at::kInt);
++
++        if (replicas_[i][0].is_cuda()) {
++          at::DeviceGuard g(replicas_[i][0].device());
++          local_used_maps_[i] = at::zeros(
++              {static_cast<long>(variable_count)}, options.pinned_memory(true));
++        } else {
++          local_used_maps_[i] =
++              at::zeros({static_cast<long>(variable_count)}, options);
++        }
++
++        // This tensor needs to be on the same device as replica because backend
++        // such as NCCL may not support CPU tensors, and hence it might not work
++        // if we always put it on CPU.
++        options = options.device(replicas_[i][0].device());
++        local_used_maps_dev_[i] =
++            at::empty({static_cast<long>(variable_count)}, options);
++      }
++    }
++  }
++
++  // To work with multiple local models (= DDPs) on a single GPU
++  reducer_list.push_back(this);
++  std::vector<bool> checker(num_buckets, false);
++  bucket_checker.push_back(checker);
++
++  if (this->model_index_ == 0) {
++    std::lock_guard<std::mutex> lock(barrier_init_mutex);
++    barrier.size = num_local_models;
++    barrier.remaining = num_local_models;
++    barrier_init_condition.notify_all();
++  } else {
++    std::unique_lock<std::mutex> lock(barrier_init_mutex);
++    barrier_init_condition.wait(lock, []() { return barrier.size > 0; } );
++  }
++
++  if (this->model_index_ == num_local_models-1) {
++    TORCH_INTERNAL_ASSERT(reducer_list.size() == num_local_models);
++    TORCH_INTERNAL_ASSERT(bucket_checker.size() == num_local_models);
++  }
++}
++
++// Note [Skip allreducing local_used_maps_dev]
++// ~~~~~~~~~~~~~~~~~~~~~~~~~~
++// If find_unused_parameters_ is set to false, there is no need to allreduce
++// local_used_maps_dev_, because all parameters will be reduced anyway.
++// Therefore, we can avoid allocating memory for local_used_maps and
++// local_used_maps_dev_ if find_unused_parameters_ is false.
++
++// Note [DDP Communication Hook]
++// ~~~~~~~~~~~~~~~~~~~~~~~~~~
++// If DDP communication hook is not registered, the reducer reduces the buckets
++// by just calling allreduce. If registered, it calls the hook and uses future
++// work handle. If registered, reducer also skips dividing grads by world size.
++// The reason for this is that the communication hook is expected to completely
++// override how we perform communication and the user should have complete
++// control over how the grads are handled.
++//
++// DDP communication hook is an enhancement that provides a hook which can be
++// used to override how DDP communicates gradients across ranks, this can be
++// used for algorithms like Gradient Compression/GossipGrad. This hook can be
++// registered from Python API using `register_comm_hook`. `PythonCommHook`
++// enables registering a Python hook and is a subclass of `CommHookInterface`.
++// Additionally, there are also some built-in C++ hook implementations that can
++// be specified by calling `register_builtin_comm_hook` from Python API.
++
++IIDPReducer::~IIDPReducer() noexcept(false) {
++  // Remove all hooks on variables registered by this IIDPReducer. This is necessary
++  // to make DDP failure recoverable. Otherwise, multiple IIDPReducer instances
++  // (from recoveries) will add their hooks to the original model, and those
++  // hooks will try to invoke methods on a deleted IIDPReducer objects.
++  for (auto& hook : hooks_) {
++    auto& key = hook.first;
++    auto& grad_accumulator = hook.second;
++    TORCH_CHECK(
++        grad_accumulator->del_post_hook(key),
++        "IIDPReducer attempts to delete a non-existing hook.");
++  }
++}
++
++// Verifies replicas in this process treat the same number of params,
++// all params require grad, and corresponding params across replicas
++// have the same dtype/size/layout.
++void IIDPReducer::verify_replicas_within_process() {
++  const auto replica_count = replicas_.size();
++  for (size_t replica_index = 0; replica_index < replica_count;
++       replica_index++) {
++    const auto variable_count = replicas_[replica_index].size();
++    TORCH_CHECK(
++        replicas_[replica_index].size() == replicas_[0].size(),
++        "Model replicas must have an equal number of parameters.");
++    TORCH_CHECK(
++        expect_sparse_gradients_[replica_index].size() ==
++            expect_sparse_gradients_[0].size(),
++        "Expected number of entries in expect_sparse_gradients ",
++        "to be equal across replicas.");
++    for (size_t variable_index = 0; variable_index < variable_count;
++         variable_index++) {
++      TORCH_CHECK(
++          replicas_[replica_index][variable_index].requires_grad(),
++          "Variables must require gradients (have `requires_grad` set).");
++      TORCH_CHECK(
++          replicas_[replica_index][variable_index].sizes() ==
++              replicas_[0][variable_index].sizes(),
++          "Variables across model replicas must have identical sizes.");
++      TORCH_CHECK(
++          replicas_[replica_index][variable_index].strides() ==
++              replicas_[0][variable_index].strides(),
++          "Variables across model replicas must have identical strides.");
++      TORCH_CHECK(
++          replicas_[replica_index][variable_index].dtype() ==
++              replicas_[0][variable_index].dtype(),
++          "Variables across model replicas must have identical dtype.");
++      TORCH_CHECK(
++          expect_sparse_gradients_[replica_index][variable_index] ==
++              expect_sparse_gradients_[0][variable_index],
++          "Expected the same variables across replicas to either both ",
++          "or neither expect a sparse gradient.");
++    }
++  }
++}
++
++// Verifies corresponding params in replica 0 have the same sizes/strides
++// across processes.
++void IIDPReducer::verify_replica0_across_processes() {
++  size_t i = 0;
++  for (const auto& t : replicas_[0]) {
++    i += 2 * t.dim();
++  }
++  at::TensorOptions options;
++  options = options.dtype(at::kLong);
++  auto metadata = at::empty({static_cast<long>(i)}, options);
++
++  // Technically, process 0 is the broadcast source, so only process 0 needs
++  // to populate metadata.  But no harm keeping work aligned across processes.
++  auto metadata_accessor = metadata.accessor<int64_t, 1>();
++  i = 0;
++  for (const auto& t : replicas_[0]) {
++    for (const auto& sz : t.sizes()) {
++      metadata_accessor[i++] = sz;
++    }
++    for (const auto& str : t.strides()) {
++      metadata_accessor[i++] = str;
++    }
++  }
++
++  auto metadata_dev = metadata.clone().to(replicas_[0][0].device());
++  std::vector<at::Tensor> vec{metadata_dev};
++  process_group_->broadcast(vec)->wait();
++
++  // Technically, process 0 doesn't need to double-check metadata, because it
++  // was the source.  But no harm keeping work aligned.
++  auto control = at::empty({static_cast<long>(i)}, options);
++  control.copy_(metadata_dev, /*non_blocking=*/false);
++  auto control_accessor = control.accessor<int64_t, 1>();
++  i = 0;
++  for (size_t p = 0; p < replicas_[0].size(); p++) {
++    const auto& t = replicas_[0][p];
++    // I'd like to include which process we are in the message,
++    // but ProcessGroup::getRank is not public!
++    for (const auto& sz : t.sizes()) {
++      TORCH_CHECK(
++          sz == control_accessor[i++],
++          "replicas[0][",
++          p,
++          "] in this process"
++          " with sizes ",
++          t.sizes(),
++          " appears not to match sizes of the same param in process 0.");
++    }
++    for (const auto& str : t.strides()) {
++      TORCH_CHECK(
++          str == control_accessor[i++],
++          "replicas[0][",
++          p,
++          "] in this process"
++          " with strides ",
++          t.strides(),
++          " appears not to match strides of the same param in process 0.");
++    }
++  }
++}
++
++void IIDPReducer::check_grad_layout(
++    const at::Tensor& grad,
++    const at::Tensor& bucket_view) {
++  // Ensure that the gradient type matches the bucket type.
++  TORCH_CHECK(
++      grad.options().type_equal(bucket_view.options()),
++      "Expected ",
++      bucket_view.toString(),
++      ", got ",
++      grad.toString());
++  TORCH_INTERNAL_ASSERT(grad.device() == bucket_view.device());
++  TORCH_INTERNAL_ASSERT(grad.numel() == bucket_view.numel());
++  // AccumulateGrad doesn't HAVE to obey the grad layout contract.
++  // The penalty for disobedience is reduced performance, not numerical
++  // death. Warnings here help diagnose poor DDP performance.
++  if (grad.strides() != bucket_view.strides()) {
++    TORCH_WARN_ONCE(
++        "Grad strides do not match bucket view strides. "
++        "This may indicate grad was not created according to the "
++        "gradient layout contract, or that the param's strides "
++        "changed since DDP was constructed.  This is not an error, "
++        "but may impair performance.\n"
++        "grad.sizes() = ",
++        grad.sizes(),
++        ", strides() = ",
++        grad.strides(),
++        "\n",
++        "bucket_view.sizes() = ",
++        bucket_view.sizes(),
++        ", strides() = ",
++        bucket_view.strides());
++  }
++  if (!gradient_as_bucket_view_) {
++    TORCH_INTERNAL_ASSERT(!grad.is_alias_of(bucket_view));
++  }
++}
++
++void IIDPReducer::copy_grad_to_bucket(
++    const at::Tensor& grad,
++    at::Tensor& bucket_view) {
++  // See Note [DDP Communication Hook]
++  if (comm_hook_ == nullptr) {
++    // imitates wrapped_scalar_tensor in ATen/native/BinaryOps.cpp
++    auto wrapped = c10::scalar_to_tensor(double(1.) / divFactor_);
++    wrapped.unsafeGetTensorImpl()->set_wrapped_number(true);
++    // Divides while copying into the bucket view.
++    at::native::mul_out(bucket_view, grad, wrapped);
++  } else {
++    // ------------------------
++    // Original code
++    bucket_view.copy_(grad);
++    // ------------------------
++  }
++}
++
++void IIDPReducer::mark_variable_ready_dense(VariableIndex index) {
++  const auto replica_index = index.replica_index;
++  const auto variable_index = index.variable_index;
++  const auto& bucket_index = variable_locators_[variable_index];
++  auto& bucket = buckets_[bucket_index.bucket_index];
++  auto& replica = bucket.replicas[replica_index];
++  auto& variable = replica.variables[bucket_index.intra_bucket_index];
++  const auto offset = replica.offsets[bucket_index.intra_bucket_index];
++  const auto length = replica.lengths[bucket_index.intra_bucket_index];
++  auto& bucket_view = replica.bucket_views_in[bucket_index.intra_bucket_index];
++
++  // Copy contents of gradient tensor to bucket tensor.
++  // If the gradient is not set, we assume it wasn't computed
++  // as part of the current backwards pass, and zero the part
++  // of the bucket it would otherwise hold.
++  runGradCallbackForVariable(variable, [&](auto& grad) {
++    if (grad.defined()) {
++      this->check_grad_layout(grad, bucket_view);
++      // When gradient_as_bucket_view_ is false, or even when
++      // gradient_as_bucket_view_ is true, in rare cases users may set grad to
++      // be None after every iteration. In these cases, grad and bucket_view are
++      // pointing to different storages and thus need to copy grads to
++      // bucket_view. If gradient_as_bucket_view_ is set as true, let grad point
++      // to bucket_view. If grad has already been set as views of buckets in
++      // previous iterations, no copy is needed.
++      if (!grad.is_alias_of(bucket_view)) {
++        this->copy_grad_to_bucket(grad, bucket_view);
++        if (gradient_as_bucket_view_) {
++          // Let grad point to bucket_view buffer.
++          grad = bucket_view;
++          // The grad is modified and need to be written back.
++          return true;
++        }
++      } else {
++        // If grad and bucket view point to the same storage, no need to copy
++        if (comm_hook_ == nullptr) {
++          bucket_view.div_(divFactor_);
++        }
++      }
++    } else {
++      bucket_view.zero_();
++    }
++    // The grad is not modified and doesn't need to be written back.
++    return false;
++  });
++}
++
++void IIDPReducer::mark_variable_ready_sparse(VariableIndex index) {
++  const auto replica_index = index.replica_index;
++  const auto variable_index = index.variable_index;
++  const auto& bucket_index = variable_locators_[variable_index];
++  auto& bucket = buckets_[bucket_index.bucket_index];
++  auto& replica = bucket.replicas[replica_index];
++  auto& variable = replica.variables[bucket_index.intra_bucket_index];
++
++  runGradCallbackForVariable(variable, [&](auto& grad) {
++    TORCH_CHECK(grad.defined(), "Expected sparse gradient to be defined.");
++    TORCH_CHECK(
++        grad.options().layout() == c10::kSparse,
++        "Expected variable to have sparse gradient.");
++
++    // Sparse tensors cannot be grouped together with other sparse tensors
++    // in a single reduction operation like we can for dense tensors.
++    // Therefore, the `offsets` and `lengths` vectors in the bucket replica
++    // struct are empty, and there is no pre-existing accumulation tensor.
++    // Directly assign the sparse tensor to the `contents` field.
++    replica.contents = grad;
++    // See Note [DDP Communication Hook]
++    if (comm_hook_ == nullptr) {
++      replica.contents.div_(divFactor_);
++    }
++    // The grad is modified in place and needs to be written back.
++    return true;
++  });
++}
++
++std::vector<std::vector<at::Tensor>> IIDPReducer::get_bucket_tensors() const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  std::vector<std::vector<at::Tensor>> bucketTensors;
++  bucketTensors.reserve(buckets_.size());
++  for (const auto& bucket : buckets_) {
++    std::vector<at::Tensor> tensors;
++    tensors.reserve(bucket.replicas.size());
++    for (const auto& rep : bucket.replicas) {
++      tensors.push_back(rep.contents);
++    }
++    bucketTensors.push_back(std::move(tensors));
++  }
++  return bucketTensors;
++}
++
++void IIDPReducer::set_forward_pass_work_handle(
++    c10::intrusive_ptr<c10d::ProcessGroup::Work> forwardPassWorkHandle,
++    bool useStaticWorldSize) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  forwardPassWorkHandle_.workHandle = std::move(forwardPassWorkHandle);
++  forwardPassWorkHandle_.useStaticWorldSize = useStaticWorldSize;
++}
++
++void IIDPReducer::reconfigure(int num_local_models, int total_num_models) {
++  total_num_models_ = total_num_models;
++  divFactor_ = total_num_models_;
++  num_local_models_ = num_local_models;
++
++  if (this->model_index_ == 0) {
++    std::lock_guard<std::mutex> lock(barrier_init_mutex);
++    barrier.size = num_local_models;
++    barrier.remaining = num_local_models;
++    barrier_init_condition.notify_all();
++  } else {
++    std::unique_lock<std::mutex> lock(barrier_init_mutex);
++    barrier_init_condition.wait(lock, []() { return barrier.size > 0; } );
++  }
++
++  if (this->model_index_ == num_local_models-1) {
++    while (reducer_list.size() != num_local_models) {
++      reducer_list.erase(reducer_list.end()-1);
++      bucket_checker.erase(bucket_checker.end()-1);
++    }
++    TORCH_INTERNAL_ASSERT(reducer_list.size() == num_local_models);
++    TORCH_INTERNAL_ASSERT(bucket_checker.size() == num_local_models);
++  }
++}
++
++std::vector<at::Tensor> IIDPReducer::get_local_used_maps_on_device() const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return local_used_maps_dev_;
++}
++
++void IIDPReducer::push_rebuilt_params_for_all_indices() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (!should_rebuild_buckets() || !rebuilt_param_indices_.empty()) {
++    return;
++  }
++  const auto replica_count = replicas_.size();
++  for (size_t replica_index = 0; replica_index < replica_count;
++       ++replica_index) {
++    const auto variable_count = replicas_[replica_index].size();
++    for (size_t variable_index = 0; variable_index < variable_count;
++         ++variable_index) {
++      const auto index = VariableIndex(replica_index, variable_index);
++      push_rebuilt_params(index);
++    }
++  }
++}
++
++void IIDPReducer::push_rebuilt_params(const VariableIndex& index) {
++  if (should_rebuild_buckets() && index.replica_index == 0) {
++    rebuilt_params_.push_back(
++        replicas_[index.replica_index][index.variable_index]);
++    rebuilt_param_indices_.push_back(index.variable_index);
++  }
++}
++
++// The function `autograd_hook` is called after the gradient for a
++// model parameter has been accumulated into its gradient tensor.
++// This function is only to be called from the autograd thread.
++void IIDPReducer::autograd_hook(VariableIndex index) {
++  std::lock_guard<std::mutex> lock(this->mutex_);
++
++  // See Note [Skip allreducing local_used_maps_dev]
++  if (find_unused_parameters_) {
++    // Since it gets here, this param has been used for this iteration. We want
++    // to mark it in local_used_maps_. During no_sync session, the same var can
++    // be set multiple times, which is OK as does not affect correctness. As
++    // long as it is used once during no_sync session, it is marked as used.
++    local_used_maps_[index.replica_index][index.variable_index] = 1;
++  }
++
++  // Ignore if we don't expect to be called.
++  // This may be the case if the user wants to accumulate gradients
++  // for number of iterations before reducing them.
++  if (!expect_autograd_hooks_) {
++    return;
++  }
++
++  // Rebuild bucket only if 1) it is the first time to rebuild bucket 2)
++  // find_unused_parameters_ is false, currently it does not support when there
++  // are unused parameters 3) this backward pass needs to run allreduce. Here,
++  // we just dump tensors and their parameter indices into rebuilt_params_ and
++  // rebuilt_param_indices_ based on gradient arriving order, and then at the
++  // end of finalize_backward(), buckets will be rebuilt based on
++  // rebuilt_params_ and rebuilt_param_indices_, and then will be broadcasted
++  // and initialized. Also we only need to dump tensors and parameter indices of
++  // one replica.
++  push_rebuilt_params(index);
++
++  // If `find_unused_parameters_` is true there may be model parameters that
++  // went unused when computing the model output, they won't be part of the
++  // autograd graph, and won't receive gradients. These parameters are
++  // discovered in the `prepare_for_backward` function and their indexes stored
++  // in the `unused_parameters_` vector.
++  if (!has_marked_unused_parameters_ && find_unused_parameters_) {
++    has_marked_unused_parameters_ = true;
++    for (const auto& unused_index : unused_parameters_) {
++      mark_variable_ready(unused_index);
++    }
++  }
++
++  // Finally mark variable for which this function was originally called.
++  mark_variable_ready(index);
++}
++
++void IIDPReducer::mark_variable_ready(VariableIndex index) {
++  const auto replica_index = index.replica_index;
++  const auto variable_index = index.variable_index;
++  TORCH_CHECK(replica_index < replicas_.size(), "Out of range replica index.");
++  TORCH_CHECK(
++      variable_index < variable_locators_.size(),
++      "Out of range variable index.");
++  backward_stats_[replica_index][variable_index] =
++      current_time_in_nanos() - backward_stats_base_;
++
++  // Any time we mark a variable ready (be it in line due to unused parameters,
++  // or via an autograd hook), we require a call to the finalize function. If
++  // this doesn't happen before the next iteration (or call to
++  // `prepare_for_backwards`), we know something is wrong.
++  require_finalize_ = true;
++
++  const auto& bucket_index = variable_locators_[variable_index];
++  auto& bucket = buckets_[bucket_index.bucket_index];
++  auto& replica = bucket.replicas[replica_index];
++  // [GC] Check variable's grad which is generated by autograd engine if finite
++  //auto& variable = replica.variables[bucket_index.intra_bucket_index];
++  //bool is_grad_finite = variable.mutable_grad().isfinite().all().is_nonzero();
++  //TORCH_INTERNAL_ASSERT(is_grad_finite);
++
++  // Something is wrong if all variables contained in this bucket replica have
++  // already been marked as ready.
++  if (replica.pending == 0) {
++    const auto common_error = c10::str(
++        "Expected to mark a variable ready only once. ",
++        "",
++        "This error is caused by one of the following reasons: ",
++        "1) Use of a module parameter outside the `forward` function. ",
++        "Please make sure model parameters are not shared across multiple ",
++        "concurrent forward-backward passes",
++        "2) Reused parameters in multiple reentrant backward passes. For ",
++        "example, if you use multiple `checkpoint` functions to wrap the ",
++        "same part of your model, it would result in the same set of ",
++        "parameters been used by different reentrant backward passes ",
++        "multiple times, and hence marking a variable ready multiple times. ",
++        "DDP does not support such use cases yet.");
++    TORCH_CHECK(
++        has_marked_unused_parameters_,
++        common_error,
++        "3) Incorrect unused parameter detection. The return value of the ",
++        "`forward` function is inspected by the distributed data parallel ",
++        "wrapper to figure out if any of the module's parameters went ",
++        "unused. For unused parameters, DDP would not expect gradients from ",
++        "then. However, if an unused parameter becomes part of the autograd ",
++        "graph at a later point in time (e.g., in a reentrant backward when ",
++        "using `checkpoint`), the gradient will show up unexpectedly. If all ",
++        "parameters in the model participate in the backward pass, you can ",
++        "disable unused parameter detection by passing the keyword argument ",
++        "`find_unused_parameters=False` to ",
++        "`torch.nn.parallel.DistributedDataParallel`.");
++    TORCH_CHECK(!has_marked_unused_parameters_, common_error);
++  }
++
++  // If it was scheduled, wait on allreduce in forward pass that tells us
++  // division factor based on no. of currently participating processes.
++  if (divFactor_ == kUnsetDivFactor) {
++    /* original code */
++    //divFactor_ = process_group_->getSize();
++    divFactor_ = total_num_models_;
++    auto& workHandle = forwardPassWorkHandle_.workHandle;
++    if (workHandle && !forwardPassWorkHandle_.useStaticWorldSize) {
++      workHandle->wait();
++      auto results = workHandle->result();
++      // Guard against the results being empty
++      TORCH_INTERNAL_ASSERT(results.size() > 0);
++      at::Tensor& res = results.front();
++      divFactor_ = res.item().to<int>();
++    }
++  }
++
++  if (bucket.expect_sparse_gradient) {
++    mark_variable_ready_sparse(index);
++  } else {
++    mark_variable_ready_dense(index);
++  }
++
++  // TODO(@pietern): Make this work for both CPU/CUDA tensors.
++  // When using CPU tensors we don't need to do this.
++  // Record event so that we can wait for all of them.
++  // auto& event = replica.events[bucket_index.intra_bucket_index];
++  // event.record();
++
++  // Check if this was the final gradient for this bucket.
++  if (--replica.pending == 0) {
++    // Kick off reduction if all replicas for this bucket are ready.
++    if (--bucket.pending == 0) {
++      if (this->model_index_ != 0) {
++        replica.event.record();
++      }
++      mark_bucket_ready(bucket_index.bucket_index);
++    }
++  }
++
++  // Run finalizer function and kick off reduction for local_used_maps once the
++  // final bucket was marked ready.
++  if (next_bucket_ == buckets_.size()) {
++    // See Note [Skip allreducing local_used_maps_dev]
++    if (find_unused_parameters_) {
++      // H2D from local_used_maps_ to local_used_maps_dev_
++      for (size_t i = 0; i < local_used_maps_.size(); i++) {
++        // We do async H2D to avoid the blocking overhead. The async copy and
++        // allreduce respect the current stream, so will be sequenced correctly.
++        local_used_maps_dev_[i].copy_(local_used_maps_[i], true);
++      }
++
++      if (model_index_ == 0) {
++        local_used_work_ = process_group_->allreduce(local_used_maps_dev_);
++      }
++    }
++
++    // The autograd engine uses the default stream when running callbacks, so we
++    // pass in the current CUDA stream in case it is not the default.
++    c10::DeviceType deviceType = replica.contents.device().type();
++    const c10::impl::VirtualGuardImpl guard =
++        c10::impl::VirtualGuardImpl{deviceType};
++    const c10::Stream currentStream =
++        guard.getStream(replica.contents.device());
++    torch::autograd::python::PythonEngine::get_python_engine(this->model_index_).queue_callback([=] {
++      std::lock_guard<std::mutex> lock(this->mutex_);
++      // Run callback with the current stream
++      c10::OptionalStreamGuard currentStreamGuard{currentStream};
++      this->finalize_backward();
++    });
++  }
++}
++
++// Called when the bucket at the specified index is ready to be reduced.
++void IIDPReducer::mark_bucket_ready(size_t bucket_index) {
++  TORCH_INTERNAL_ASSERT(bucket_index >= next_bucket_);
++
++  if (this->model_index_ != 0) {
++    this->bucket_checker[this->model_index_][bucket_index] = true;
++  }
++  // Buckets are reduced in sequence. Ignore this bucket if
++  // it's not its turn to be reduced.
++  if (bucket_index > next_bucket_) {
++    return;
++  }
++
++  barrier.arrive_and_wait();
++
++  // Keep going, until we either:
++  // - have kicked off reduction for all buckets, or
++  // - found a bucket that's not yet ready for reduction.
++
++  for (; next_bucket_ < buckets_.size() && buckets_[next_bucket_].pending == 0;
++       next_bucket_++) {
++    auto& bucket = buckets_[next_bucket_];
++    std::vector<at::Tensor> tensors;
++    tensors.reserve(bucket.replicas.size());
++    int replica_idx = 0;
++    for (auto& replica : bucket.replicas) {
++      // TODO(@pietern): Ensure proper synchronization with the CUDA events
++      // that recorded copies into this contents tensor. If these copies are
++      // executed on non-default streams, the current stream for the device
++      // that holds the contents tensor must wait on these events.
++      //
++      // As long as autograd uses the default stream for every device,
++      // these operations are implicitly sequenced, and we don't need to
++      // do any extra synchronization here.
++
++      // Do local aggregation in model index 0
++      if (this->model_index_ == 0 && this->num_local_models_ > 1) {
++        for (int i = 0 ; i < num_local_models_ ; i++) {
++          IIDPReducer* virtual_reducer = this->reducer_list[i];
++          if (virtual_reducer->model_index_ == 0)
++            continue;
++          TORCH_INTERNAL_ASSERT(this->bucket_checker[virtual_reducer->model_index_][next_bucket_] == true);
++          auto& aggregate_bucket = virtual_reducer->buckets_[next_bucket_];
++          auto& aggregate_replica = aggregate_bucket.replicas[replica_idx];
++          auto& aggregate_event = aggregate_replica.event;
++          if (replica.contents.sizes() != aggregate_replica.contents.sizes()) {
++            std::cout << "[ERROR] replica.contents.sizes() != aggregate_replica.contents.sizes() "
++                      << replica.contents.sizes() << " " << aggregate_replica.contents.sizes() << std::endl;
++            TORCH_INTERNAL_ASSERT(replica.contents.sizes() == aggregate_replica.contents.sizes());
++          }
++          at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
++          aggregate_event.block(stream);
++          replica.contents.add_(aggregate_replica.contents);
++        }
++      }
++      tensors.push_back(replica.contents);
++      replica_idx++;
++    }
++    // See Note [DDP Communication Hook]
++    // TODO(@sinannasir): merge `work` and `future_work`. Related to GH Issue
++    // #41266.
++    if (comm_hook_ == nullptr) {
++      if (this->model_index_ == 0) {
++        bucket.work = process_group_->allreduce(tensors);
++      }
++      else {
++        bucket.work = process_group_->get_dummy_work(tensors);
++      }
++    } else {
++      GradBucket grad_bucket(
++          next_bucket_,
++          tensors,
++          // Since currently we do not support single-process multiple-device
++          // mode, we can assume only one replica in the bucket.
++          bucket.replicas[0].offsets,
++          bucket.replicas[0].lengths,
++          bucket.replicas[0].sizes_vec);
++      bucket.future_work = comm_hook_->runHook(grad_bucket);
++    }
++  }
++
++  barrier.arrive_and_wait();
++  if (this->model_index_ != 0) {
++    this->bucket_checker[this->model_index_][bucket_index] = false;
++  }
++}
++
++void IIDPReducer::initialize_buckets(
++    std::vector<std::vector<size_t>> bucket_indices) {
++  // If initialize_buckets is called inside DDP constructor, then
++  // it does not matter rpc context ptr is nullptr or not, as grad
++  // will not be mutated.
++  // If initialize_buckets is called during training loop, e.g, inside
++  // rebuild_buckets(), since grad could be mutated and be pointed to
++  // bucket_view, then it needs to check rpc context ptr is nullptr or not,
++  // If rpc context ptr is nullptr, mutate variable.grad(); otherwise,
++  // mutate grad in rpc context.
++#ifndef _WIN32
++  using torch::distributed::autograd::ThreadLocalDistAutogradContext;
++  this->rpc_context_.set(ThreadLocalDistAutogradContext::getContextPtr());
++#endif
++
++  // This shouldn't be called if we're expecting autograd hooks to fire.
++  TORCH_CHECK(
++      !expect_autograd_hooks_,
++      "`initialize_buckets` must NOT be called during autograd execution.");
++
++  // Clear current bucket assignment.
++  buckets_.clear();
++  variable_locators_.clear();
++
++  // Ensure we have a bucket index for every variable.
++  variable_locators_.resize(replicas_[0].size());
++
++  // Iterate over buckets.
++  const auto bucket_count = bucket_indices.size();
++  const auto replica_count = replicas_.size();
++  buckets_.reserve(bucket_count);
++  for (size_t bucket_index = 0; bucket_index < bucket_count; bucket_index++) {
++    Bucket bucket;
++
++    // TODO(@pietern): Validate indices.
++    // Must be non-empty, unique, and unique across buckets.
++    TORCH_CHECK(
++        bucket_indices[bucket_index].size() > 0, "Empty bucket specified.");
++
++    // Variables that expect sparse gradients must have their own bucket.
++    if (bucket_indices[bucket_index].size() == 1) {
++      const auto variable_index = bucket_indices[bucket_index].front();
++      bucket.expect_sparse_gradient =
++          expect_sparse_gradients_[0][variable_index];
++    } else {
++      for (const auto variable_index : bucket_indices[bucket_index]) {
++        TORCH_CHECK(
++            !expect_sparse_gradients_[0][variable_index],
++            "Buckets with more than one variable cannot include variables ",
++            "that expect a sparse gradient.");
++      }
++    }
++
++    // Iterate over model replicas.
++    for (size_t replica_index = 0; replica_index < replica_count;
++         replica_index++) {
++      BucketReplica replica;
++
++      if (bucket.expect_sparse_gradient) {
++        const auto variable_index = bucket_indices[bucket_index].front();
++        const auto& variable = replicas_[replica_index][variable_index];
++        TORCH_INTERNAL_ASSERT(bucket_indices[bucket_index].size() == 1);
++        replica.variables = {variable};
++      } else {
++        at::TensorOptions options;
++        // The start index of the variable in the flattened tensor.
++        size_t offset = 0;
++
++        // Reserve enough space for the per-variable fields stored in bucket
++        // replica for efficiency.
++        const size_t num_variables = bucket_indices[bucket_index].size();
++        replica.variables.reserve(num_variables);
++        replica.offsets.reserve(num_variables);
++        replica.lengths.reserve(num_variables);
++        replica.sizes_vec.reserve(num_variables);
++
++        // Iterate over bucket variables.
++        for (const auto variable_index : bucket_indices[bucket_index]) {
++          TORCH_CHECK(
++              variable_index < replicas_[replica_index].size(),
++              "Out of range variable index specified.");
++          const auto& variable = replicas_[replica_index][variable_index];
++          if (!options.has_device()) {
++            options = options.device(variable.device());
++          } else {
++            TORCH_CHECK(
++                variable.device() == options.device(),
++                "All parameters in a bucket must be ",
++                "placed on the same device.");
++          }
++          if (!options.has_dtype()) {
++            options = options.dtype(variable.dtype());
++          } else {
++            TORCH_CHECK(
++                variable.dtype() == options.dtype(),
++                "All parameters in a bucket must have the same dtype.");
++          }
++          const auto length = variable.numel();
++          replica.variables.push_back(variable);
++          replica.offsets.push_back(offset);
++          replica.lengths.push_back(length);
++          replica.sizes_vec.push_back(variable.sizes());
++          offset += length;
++        }
++
++        // Allocate bucket contents tensor.
++        replica.contents = at::empty({static_cast<long>(offset)}, options);
++
++        // Note:  "Gradient Layout Contract"
++        //
++        // Here, create views into the contents tensor for each variable's grad.
++        // Views serve as entry points to copy_ each grad's data in/out of the
++        // flat contents tensor.
++        //
++        // Gradients may have dense memory but non-row-major-contiguous strides
++        // (e.g. channels_last or channels_last_3d). For coalesced accesses
++        // during copy_s, it's beneficial for each view's layout to match its
++        // grad's layout.
++        //
++        // Specifically, we expect torch/csrc/autograd/AccumulateGrad.h produces
++        // grads that obey there "Gradient Layout Contract":
++        //   (1) if variable.is_non_overlapping_and_dense(), the stashed grad's
++        //       strides match variable.
++        //   (2) else, stashed grad is rowmajor contiguous.
++        // and create views to match.
++        //
++        // If AccumulateGrad breaks the contract, and produces a grad with an
++        // unexpected layout, performance will degrade due to poor memory access
++        // patterns when copy_ing grad data in and out of its bucket view.
++        // However, numerics remain correct, because the bucket view is the same
++        // on either end of the raw allreduce.  bucket_view_in.copy(grad)
++        // tranposes
++        // (+ densifies) to the bucket view's layout, the data is allreduced,
++        // then grad.copy_(bucket_view_out) transposes it back to grad's layout.
++        //
++        // The only way the numerics can go haywire is if the bucket views
++        // themselves have different layouts across processes (or replicas).
++        // Bucket views' sizes and strides are set based on param layouts, using
++        // the same logic that (we expect) AccumulateGrad uses for their grads.
++        // Therefore, the only way a bucket view could have different layouts in
++        // different processes is if its param has a different layout in
++        // different processes. We can check that param layouts match across
++        // processes and replicas in IIDPReducer's constructor by allreducing some
++        // metadata.  Checking just once won't catch if someone messes with
++        // param layouts over time, but not messing with params after DDP
++        // construction is already a documented constraint.
++        initialize_bucket_views(replica, replica.contents);
++      }
++
++      // Add bucket replica to enclosing bucket.
++      bucket.replicas.push_back(std::move(replica));
++    }
++
++    // Map participating variables to this bucket.
++    // This is identical across replicas so we only need to do this once.
++    size_t intra_bucket_index = 0;
++    for (const auto variable_index : bucket_indices[bucket_index]) {
++      TORCH_CHECK(
++          variable_index < variable_locators_.size(),
++          "Out of range variable index specified.");
++      variable_locators_[variable_index] =
++          VariableLocator(bucket_index, intra_bucket_index++);
++    }
++    bucket.variable_indices = std::move(bucket_indices[bucket_index]);
++
++    buckets_.push_back(std::move(bucket));
++  }
++}
++
++// (see Note:  "Gradient Layout Contract" in initialize_buckets).
++void IIDPReducer::initialize_bucket_views(
++    IIDPReducer::BucketReplica& replica,
++    at::Tensor& contents) {
++  for (size_t i = 0; i < replica.variables.size(); i++) {
++    auto& v = replica.variables[i];
++    const auto offset = replica.offsets[i];
++    const auto length = replica.lengths[i];
++    if (v.is_non_overlapping_and_dense()) {
++      // If the param's memory is dense, match its layout, anticipating
++      // the autograd engine (AccumulateGrad) will also create gradients
++      // matching its layout.
++      replica.bucket_views_in.push_back(
++          contents.as_strided(v.sizes(), v.strides(), offset));
++    } else {
++      // Fall back to a C-style contiguous view, again anticipating
++      // AccumulateGrad will do the same when stashing grads for non-dense
++      // params.
++      replica.bucket_views_in.push_back(
++          contents.narrow(0, offset, length).view(v.sizes()));
++    }
++    // By default `bucket_views_out` and `bucket_views_in` are
++    // essentially the same thing.
++    replica.bucket_views_out = replica.bucket_views_in;
++
++    // If gradient_as_bucket_view_ is set as true, then there are two cases to
++    // handle: initialize_bucket_views could be called inside initialize_buckets
++    // when rebuild_buckets, if grad has already been defined/calculated in
++    // previous iteration, old grad needs to be copied into new bucket_view and
++    // let grad point to the new bucket_view, initialize_bucket_views could also
++    // be called inside initialize_buckets during construction. Grads are not
++    // defined during construction time, in this case, do not let grad point to
++    // bucket_view, because grads should be kept as being undefined for globally
++    // unused parameters.
++    if (gradient_as_bucket_view_) {
++      auto& bucket_view = replica.bucket_views_in.back();
++      runGradCallbackForVariable(v, [&](auto& grad) {
++        if (grad.defined() && !grad.is_alias_of(bucket_view)) {
++          bucket_view.copy_(grad);
++          grad = bucket_view;
++          // The grad is modefied and needs to be written back.
++          return true;
++        }
++        // The grad is not modified and does not need to be written back.
++        return false;
++      });
++    }
++  }
++}
++
++// (see Note:  "Gradient Layout Contract" in initialize_buckets).
++void IIDPReducer::populate_bucket_views_out(
++    IIDPReducer::BucketReplica& replica,
++    at::Tensor& tensor) {
++  replica.bucket_views_out.clear();
++  for (size_t i = 0; i < replica.variables.size(); i++) {
++    const auto& v = replica.variables[i];
++    const auto offset = replica.offsets[i];
++    const auto length = replica.lengths[i];
++    if (v.is_non_overlapping_and_dense()) {
++      // If the param's memory is dense, match its layout, anticipating
++      // the autograd engine (AccumulateGrad) will also create gradients
++      // matching its layout.
++      replica.bucket_views_out.push_back(
++          tensor.as_strided(v.sizes(), v.strides(), offset));
++    } else {
++      // Fall back to a C-style contiguous view, again anticipating
++      // AccumulateGrad will do the same when stashing grads for non-dense
++      // params.
++      replica.bucket_views_out.push_back(
++          tensor.narrow(0, offset, length).view(v.sizes()));
++    }
++  }
++}
++
++// Traverse the autograd graph starting at the specified output.
++// All parameters for which we have a pointer to their gradient accumulation
++// functions, but don't show up in the autograd graph will be marked ready for
++// for reduction as soon as the first autograd hook is called. This is not
++// done immediately because the model output may be ignored, and we only
++// want to start performing reductions on `torch.autograd.backward()`.
++void IIDPReducer::prepare_for_backward(
++    const std::vector<torch::autograd::Variable>& outputs) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  std::unordered_set<torch::autograd::Node*> seen;
++  std::vector<torch::autograd::Node*> queue;
++
++  // Reset accounting.
++  expect_autograd_hooks_ = true;
++  next_bucket_ = 0;
++  backward_stats_base_ = current_time_in_nanos();
++  for (auto& bucket : buckets_) {
++    for (auto& replica : bucket.replicas) {
++      replica.pending = replica.variables.size();
++    }
++    bucket.pending = bucket.replicas.size();
++  }
++
++  // Reset unused parameter accounting.
++  has_marked_unused_parameters_ = false;
++  unused_parameters_.clear();
++
++  // If find_unused_parameters_ is false, we assume that autograd hooks for ALL
++  // variables will be called, and we don't have to search the autograd graph
++  // for presence of these hooks.
++  if (!find_unused_parameters_) {
++    return;
++  }
++
++  // Seed queue with the grad functions of all outputs.
++  for (const auto& output : outputs) {
++    const auto& grad_fn = output.grad_fn();
++    if (grad_fn) {
++      queue.push_back(grad_fn.get());
++    }
++  }
++
++  // Traverse the autograd graph starting at the specified output.
++  while (!queue.empty()) {
++    auto fn = queue.back();
++    queue.pop_back();
++    for (const auto& edge : fn->next_edges()) {
++      if (auto next_ptr = edge.function.get()) {
++        const bool was_inserted = seen.insert(next_ptr).second;
++        if (was_inserted) {
++          queue.push_back(next_ptr);
++        }
++      }
++    }
++  }
++
++  // Find accumulator functions that don't show up in this graph.
++  for (const auto& it : gradAccToVariablesMap_) {
++    // If the accumulator function is present in the graph, we know
++    // a gradient will be computed for the corresponding parameter.
++    if (seen.count(it.first) == 0) {
++      auto& indices = it.second;
++      unused_parameters_.reserve(unused_parameters_.size() + indices.size());
++      unused_parameters_.insert(
++          unused_parameters_.end(), indices.begin(), indices.end());
++    }
++  }
++
++  // Warn user about unnecessary perf hit if all parameters were used.
++  if (unused_parameters_.empty()) {
++    TORCH_WARN_ONCE(
++        "find_unused_parameters=True was specified in DDP constructor, "
++        "but did not find any unused parameters. This flag results in an extra "
++        "traversal of the autograd graph every iteration, which can adversely "
++        "affect performance. If your model indeed never has any unused "
++        "parameters, consider turning this flag off. Note that this warning may "
++        "be a false positive your model has flow control causing later iterations "
++        "to have unused parameters.");
++  }
++}
++
++void IIDPReducer::copy_bucket_to_grad(
++    torch::autograd::Variable& variable,
++    IIDPReducer::BucketReplica& replica,
++    size_t intra_bucket_index,
++    bool global_unused) {
++  const auto& bucket_view = replica.bucket_views_out[intra_bucket_index];
++  runGradCallbackForVariable(variable, [&](auto& grad) {
++    // If a parameter is globally unused, we keep its grad untouched.
++    if (!global_unused) {
++      if (!grad.defined()) {
++        // Creates grad according to the "Gradient Layout Contract"
++        // (see torch/csrc/grad/AccumulateGrad.h)
++        grad =
++            torch::autograd::utils::clone_obey_contract(bucket_view, variable);
++      } else {
++        grad.copy_(bucket_view);
++      }
++      // The grad is modified and needs to be written back.
++      return true;
++    }
++    // The grad is not modified.
++    return false;
++  });
++}
++
++// A bucket with one or more dense tensors needs to be unflattened.
++void IIDPReducer::finalize_bucket_dense(Bucket& bucket) {
++  for (size_t replica_index = 0; replica_index < bucket.replicas.size();
++       replica_index++) {
++    auto& replica = bucket.replicas[replica_index];
++    for (size_t intra_bucket_index = 0;
++         intra_bucket_index < replica.variables.size();
++         intra_bucket_index++) {
++      auto& variable = replica.variables[intra_bucket_index];
++      const auto offset = replica.offsets[intra_bucket_index];
++      const auto length = replica.lengths[intra_bucket_index];
++
++      bool global_unused = false;
++      // See Note [Skip allreducing local_used_maps_dev]
++      if (find_unused_parameters_) {
++        // Determine if this param has been used globally or not.
++        //
++        // If the variable was used locally, it is also used globally and then
++        // we don't need to wait for the reduction. Otherwise we lazily wait for
++        // the reduction to complete, only when we see a variable that was
++        // unused locally. Then we end up delaying the synchronization point
++        // that local_used_work_->wait() implies. If we don't have any unused
++        // parameters at all, we can skip waiting for the work to complete
++        // altogether, and cause negligible performance overhead for models
++        // where all parameters are used. Such lazily waiting means minimizing
++        // performance impact for the big majority of models where all
++        // parameters are always used. Then we only pay the overhead cost if
++        // there is indeed a parameter that is locally unused, because we need
++        // to check if it's also globally unused.
++        size_t variable_index = bucket.variable_indices[intra_bucket_index];
++        // Note: global_unused might not be global yet. As we lazily wait for
++        // the reduction to complete, it becomes really global only if we get to
++        // the point as below where we wait for the reduction work, make D2H
++        // copy, and update global_unused with the real global consensus, i.e.
++        // local_used_maps_reduced_ is true.
++        global_unused =
++            local_used_maps_[replica_index][variable_index].item<int>() == 0;
++        if (global_unused && !local_used_maps_reduced_) {
++          // Wait for local_used_maps reduction to complete.
++          if (model_index_ == 0) {
++            local_used_work_->wait();
++          }
++          // D2H from local_used_maps_dev_ to local_used_maps_
++          for (size_t i = 0; i < local_used_maps_.size(); i++) {
++            local_used_maps_[i].copy_(local_used_maps_dev_[i]);
++          }
++          global_unused =
++              local_used_maps_[replica_index][variable_index].item<int>() == 0;
++          local_used_maps_reduced_ = true;
++        }
++      }
++
++      if (!gradient_as_bucket_view_) {
++        copy_bucket_to_grad(
++            variable, replica, intra_bucket_index, global_unused);
++      } else {
++        const auto& bucket_view_out =
++            replica.bucket_views_out[intra_bucket_index];
++        auto& bucket_view_in = replica.bucket_views_in[intra_bucket_index];
++        // If communication_hook is registered, bucket_view_out stores
++        // allreduced results in a newly allocated tensor, copy bucket_view_out
++        // back to bucket_view_in that referring to replica.content tensor and
++        // grad.
++        if (!bucket_view_in.is_alias_of(bucket_view_out)) {
++          bucket_view_in.copy_(bucket_view_out);
++        }
++        runGradCallbackForVariable(variable, [&](auto& grad) {
++          // If a parameter is globally unused, we keep its grad untouched.
++          if (!global_unused) {
++            // If grad is globally used but locally unused, let grad point to
++            // bucket_view_in
++            if (!grad.defined()) {
++              grad = bucket_view_in;
++            } else {
++              if (!grad.is_alias_of(bucket_view_in)) {
++                grad.copy_(bucket_view_in);
++                TORCH_WARN_ONCE(
++                    "Detected at least one parameter gradient is not the "
++                    "expected DDP bucket view when setting "
++                    "gradient_as_bucket_view=True. This can happen when "
++                    "multiple parameters sharing the same gradient. For "
++                    "example, param0 and param1 share the same gradient "
++                    "grad0. In this case, grad0 would first point to "
++                    "bucket_view_in0 when param0 is ready. Later, when "
++                    "param1 is ready, it will override grad0 to point to "
++                    "bucket_view_in1. However, param0 still expects grad0 "
++                    "to point to bucket_view_in0, and hence hit this "
++                    "warning. If you saw this message, please double-check if "
++                    "the above situation is expected for your application.");
++              }
++            }
++            // The grad is modified and needs to be written back.
++            return true;
++          }
++          // The grad is not modified.
++          return false;
++        });
++      }
++    }
++  }
++}
++
++void IIDPReducer::finalize_backward() {
++  // No longer expect autograd hooks to fire after this function returns.
++  TORCH_INTERNAL_ASSERT(expect_autograd_hooks_);
++  expect_autograd_hooks_ = false;
++
++  // No longer require call to finalize after this function returns.
++  TORCH_INTERNAL_ASSERT(require_finalize_);
++  require_finalize_ = false;
++
++  // Unset allreduce division factor, as it may change in next backwards pass
++  // when running with DDP join mode.
++  divFactor_ = kUnsetDivFactor;
++
++  // Check that all buckets were completed and had their work kicked off.
++  TORCH_INTERNAL_ASSERT(next_bucket_ == buckets_.size());
++
++  // Wait for asynchronous reduction to complete and unflatten contents.
++  for (auto& bucket : buckets_) {
++    // See Note [DDP Communication Hook]
++    if (comm_hook_ == nullptr) {
++      TORCH_INTERNAL_ASSERT(
++          bucket.work,
++          "Expected bucket.work not to be null. "
++          "This may indicate that allreduce hooks were not properly installed.");
++      bucket.work->wait();
++    } else {
++      TORCH_INTERNAL_ASSERT(
++          bucket.future_work,
++          "Expected bucket.future_work not to be null. "
++          "This may indicate that communication hook was not properly installed.");
++      bucket.future_work->wait();
++      if (this->model_index_ == 0) {
++        auto future_result =
++            comm_hook_->parseHookResult(bucket.future_work->value());
++
++        for (size_t i = 0; i < future_result.size(); i++) {
++          auto& replica = bucket.replicas[i];
++          if (bucket.expect_sparse_gradient) {
++            replica.contents.copy_(future_result[i]);
++          } else {
++            // Reinitialize only `bucket_views_out` with the future_result by
++            // following the same logic in `initialize_buckets`.
++            populate_bucket_views_out(replica, future_result[i]);
++          }
++        }
++      }
++    }
++    if (!bucket.expect_sparse_gradient) {
++      // We don't need to finalize the sparse bucket since the sparse grad and
++      // the bucket essentially point to the same storage. As a result, once
++      // the allreduce is done, the sparse grads are automatically updated.
++      finalize_bucket_dense(bucket);
++    }
++  }
++
++  // See Note [Skip allreducing local_used_maps_dev]
++  if (find_unused_parameters_) {
++    // Reset unused parameter accounting.
++    for (auto& local_used : local_used_maps_) {
++      local_used.fill_(0);
++    }
++    // Due to the lazy wait, it is possible that reduction of the current
++    // iteration is still going when the one for next iteration gets kicked off.
++    // For such case, we want to wait explicitly to make sure the reduction does
++    // complete before kicking off next one. Otherwise the previous one may
++    // interfere, write to the device-side memory and clobber the content of
++    // local_unused_maps_dev_.
++    if (!local_used_maps_reduced_ && model_index_ == 0) {
++      local_used_work_->wait();
++    }
++    local_used_maps_reduced_ = false;
++  }
++}
++
++void IIDPReducer::runGradCallbackForVariable(
++    torch::autograd::Variable& variable,
++    GradCallback&& cb) {
++  auto context_ptr = rpc_context_.context_ptr.load();
++  if (context_ptr == nullptr) {
++    cb(variable.mutable_grad());
++  } else {
++// Under distributed autograd
++#ifndef _WIN32
++    context_ptr->runGradCallbackForVariable(variable, std::move(cb));
++#endif
++  }
+ }
+ 
+-constexpr int kUnsetDivFactor = -1;
++void IIDPReducer::RpcContext::set(ContextPtr&& new_context_ptr) {
++  // We should set 'new_context_ptr' even if it's nullptr. That means the
++  // reducer is under a local backward run.
++  const auto new_context_raw_ptr = new_context_ptr.get();
++  if (context_ptr.exchange(new_context_raw_ptr) != new_context_raw_ptr) {
++    // Set the shared ptr to the context only if it's set first time.
++    // All call sites should use the same context ptr.
++    // Use an atomic to avoid data race from multiple threads.
++    context_ptr_holder = std::move(new_context_ptr);
++  }
++}
+ 
+-} // namespace
++void IIDPReducer::sync_bucket_indices(
++    std::vector<std::vector<size_t>>& bucket_indices) {
++  auto num_buckets = bucket_indices.size();
++  std::vector<size_t> bucket_sizes;
++  bucket_sizes.reserve(num_buckets);
++  int64_t total_size = 0;
++  for (size_t i = 0; i < num_buckets; i++) {
++    auto bucket_size = bucket_indices.at(i).size();
++    bucket_sizes.push_back(bucket_size);
++    total_size += bucket_size;
++  }
++
++  at::TensorOptions options;
++  options = options.dtype(at::kInt);
++  options = options.device(replicas_[0][0].device());
++
++  // Group indices and num_bucket together into indices_tensor
++  // Broadcast this tensor first, as its size is equal among all processes
++  auto indices_tensor = at::empty({total_size + 1}, at::kInt);
++  auto indices_accessor = indices_tensor.accessor<int, 1>();
++  auto indices_accessor_Index = 0;
++  for (size_t i = 0; i < num_buckets; i++) {
++    const auto& bucket_size = bucket_indices.at(i).size();
++    for (size_t j = 0; j < bucket_size; j++) {
++      indices_accessor[indices_accessor_Index++] = bucket_indices[i][j];
++    }
++  }
++  indices_accessor[indices_accessor_Index] = num_buckets;
++
++  // Copy CPU tensor to device tensor, as the process_group_ could be NCCL and
++  // it can only broadcast device tensors.
++  auto indices_tensor_device = at::empty({total_size + 1}, options);
++  indices_tensor_device.copy_(indices_tensor, /*non_blocking=*/true);
++  std::vector<at::Tensor> indices_tensor_list = {indices_tensor_device};
++  process_group_->broadcast(indices_tensor_list)->wait();
++  indices_tensor.copy_(indices_tensor_list.front(), /*non_blocking=*/false);
++
++  // Update num_buckets after receiving it from rank 0
++  num_buckets = indices_accessor[indices_accessor_Index];
++
++  // Broadcast bucket_sizes
++  auto bucket_sizes_tensor = at::empty({(int64_t)num_buckets}, at::kInt);
++  auto bucket_sizes_accessor = bucket_sizes_tensor.accessor<int, 1>();
++  for (size_t i = 0; i < num_buckets; i++) {
++    // For rank != 0, it is possible that local num buckets bucket_sizes.size()
++    // is smaller than broadcasted num_buckets
++    bucket_sizes_accessor[i] =
++        bucket_sizes.at(std::min(i, (bucket_sizes.size() - 1)));
++  }
++  auto bucket_sizes_tensor_device = at::empty({(int64_t)num_buckets}, options);
++  bucket_sizes_tensor_device.copy_(bucket_sizes_tensor, /*non_blocking=*/true);
++  std::vector<at::Tensor> bucket_sizes_tensor_list = {
++      bucket_sizes_tensor_device};
++  process_group_->broadcast(bucket_sizes_tensor_list)->wait();
++  bucket_sizes_tensor.copy_(
++      bucket_sizes_tensor_list.front(), /*non_blocking=*/false);
++
++  // Clear bucket_indices first, and then update bucket_indices using received
++  // num_buckets, bucket_sizes_tensor and indices_tensor from rank 0
++  bucket_indices.clear();
++  bucket_indices.reserve(num_buckets);
++  indices_accessor_Index = 0;
++  for (size_t i = 0; i < num_buckets; i++) {
++    const auto& bucket_size = bucket_sizes_accessor[i];
++    std::vector<size_t> bucket;
++    bucket.reserve(bucket_size);
++    for (size_t j = 0; j < bucket_size; j++) {
++      bucket.push_back(indices_accessor[indices_accessor_Index++]);
++    }
++    bucket_indices.emplace_back(std::move(bucket));
++  }
++}
++
++bool IIDPReducer::rebuild_buckets() {
++  // Ensure reduction for previous backwards pass is finished. If user's model
++  // has unused parameters for example, this will raise an error recommending to
++  // run with find_unused_parameters=True, instead of the size mismatch
++  // exception below.
++  //
++  ensure_prior_reduction_finished();
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (!should_rebuild_buckets() || rebuilt_params_.empty()) {
++    return false;
++  }
++
++  TORCH_INTERNAL_ASSERT(
++      rebuilt_params_.size() == rebuilt_param_indices_.size(),
++      c10::str(
++          "rebuilt parameter tensors size is not same as rebuilt parameter indices size: ",
++          rebuilt_params_.size(),
++          " versus ",
++          rebuilt_param_indices_.size()));
++  TORCH_INTERNAL_ASSERT(
++      replicas_[0].size() == rebuilt_param_indices_.size(),
++      c10::str(
++          "rebuilt parameter indices size is not same as original model parameters size.",
++          "Original model param size is: ",
++          replicas_[0].size(),
++          " versus rebuilt params size of: ",
++          rebuilt_param_indices_.size()));
++  std::vector<std::vector<size_t>> rebuilt_bucket_indices;
++  std::vector<size_t> bucket_size_limits;
++  bucket_size_limits.push_back(kDefaultFirstBucketBytes);
++  bucket_size_limits.push_back(bucket_bytes_cap_);
++  rebuilt_bucket_indices = compute_bucket_assignment_by_size(
++      rebuilt_params_,
++      bucket_size_limits,
++      expect_sparse_gradients_[0],
++      rebuilt_param_indices_);
++
++  // For rebuilt bucket indices, it needs to be synced across all ranks.
++  // Broadcast the newly rebuilt bucket indices from rank 0 in default.
++  // After syncing up rebuilt bucket indices, initialize buckets for reducer.
++  // [IIDP] Not need to sync rebuilt bucket indices. When it's done, stuck happens.
++  // sync_bucket_indices(rebuilt_bucket_indices);
++  if (process_group_->getRank() == 0) {
++    std::cout << "[INFO][torch/lib/c10d/reducer.cpp] IIDPReducer::rebuild_buckets() -  rebuilt bucket size: "
++              << rebuilt_bucket_indices.size()
++              << std::endl;
++  }
++
++  has_rebuilt_bucket_ = true;
++  rebuilt_params_.clear();
++  rebuilt_param_indices_.clear();
++  rebuilt_bucket_indices_ = rebuilt_bucket_indices; // To used in get_rebuilt_bucket_indices()
++
++  initialize_buckets(std::move(rebuilt_bucket_indices));
++  return true;
++}
++
++// See Note [DDP Communication Hook]
++void IIDPReducer::register_comm_hook(std::unique_ptr<CommHookInterface> iface) {
++  TORCH_CHECK(
++      comm_hook_ == nullptr,
++      "register_comm_hook or register_builtin_comm_hook can only be called once.");
++  // TODO(#42542): Single-process multiple-device mode support for DDP
++  // communication hook.
++  TORCH_CHECK(
++      replicas_.size() == 1,
++      "Communication hook does not support single-process multiple-device mode.");
++  comm_hook_ = std::move(iface);
++}
++
++// See Note [DDP Communication Hook]
++void IIDPReducer::register_builtin_comm_hook(
++    c10d::BuiltinCommHookType comm_hook_type) {
++  TORCH_CHECK(
++      comm_hook_ == nullptr,
++      "register_builtin_comm_hook or register_comm_hook can only be called once.");
++  TORCH_CHECK(
++      replicas_.size() == 1,
++      "Communication hook does not support single-process multiple-device mode.");
++  // TODO: Support GLOO and MPI backends for DDP communication hook.
++  TORCH_CHECK(
++      process_group_->getBackendName() == "nccl",
++      "register_builtin_comm_hook currently can only support NCCL backend, but the current backend is %s.",
++      process_group_->getBackendName());
++
++  switch (comm_hook_type) {
++    case c10d::BuiltinCommHookType::ALLREDUCE:
++      comm_hook_ =
++          std::make_unique<c10d::AllReduceCommHook>(process_group_.get());
++      LOG(INFO) << "Built-in communication hook ALLREDUCE is registered.";
++      break;
++    case c10d::BuiltinCommHookType::FP16_COMPRESS:
++      comm_hook_ =
++          std::make_unique<c10d::FP16CompressCommHook>(process_group_.get());
++      LOG(INFO) << "Built-in communication hook FP16_COMPRESS is registered.";
++      break;
++    default:
++      TORCH_WARN_ONCE(
++          "Unknown built-in DDP comm hook type is provided. No comm hook will be used.");
++  }
++}
++
++void IIDPReducer::ensure_prior_reduction_finished() {
++  // Check that any prior reduction has finished.
++  // The variable `require_finalize_` is true until all gradients
++  // have been computed and reduction of all buckets has been kicked off.
++  if (require_finalize_) {
++    TORCH_CHECK(
++        false,
++        "Expected to have finished reduction in the prior iteration before ",
++        "starting a new one. ",
++        "",
++        "This error indicates that your module has parameters that were ",
++        "not used in producing loss. ",
++        "",
++        "You can enable unused parameter detection by (1) passing the keyword "
++        "argument `find_unused_parameters=True` to ",
++        "`torch.nn.parallel.DistributedDataParallel`; (2) making sure all ",
++        "`forward` function outputs participate in calculating loss. "
++        "",
++        "If you already have done the above two steps, then the distributed ",
++        "data parallel module wasn't able to locate the output tensors in the ",
++        "return value of your module's `forward` function. ",
++        "Please include the loss function and the structure of the return ",
++        "value of `forward` of your module when reporting this issue (e.g. ",
++        "list, dict, iterable).");
++  }
++}
++
++void IIDPReducer::set_construction_logging_data(
++    const std::string& module_name,
++    const std::vector<int>& device_ids,
++    int output_device,
++    bool broadcast_buffers) {
++  ddp_logging_data_->module_name = module_name;
++  ddp_logging_data_->device_ids = device_ids;
++  ddp_logging_data_->output_device = output_device;
++  ddp_logging_data_->broadcast_buffers = broadcast_buffers;
++  ddp_logging_data_->world_size = process_group_->getSize();
++  ddp_logging_data_->rank = process_group_->getRank();
++  ddp_logging_data_->bucket_cap_mb = bucket_bytes_cap_ / (1024 * 1024);
++  ddp_logging_data_->find_unused_parameters = find_unused_parameters_;
++  ddp_logging_data_->gradient_as_bucket_view = gradient_as_bucket_view_;
++  ddp_logging_data_->backend_name = process_group_->getBackendName();
++
++  LogPyTorchDDPUsage(*ddp_logging_data_);
++}
++
++c10::DDPLoggingData IIDPReducer::get_ddp_logging_data() {
++  return *ddp_logging_data_;
++}
+ 
++
++// ============= Original Reducer ===================
+ Reducer::Reducer(
+     std::vector<std::vector<torch::autograd::Variable>> replicas,
+     std::vector<std::vector<size_t>> bucket_indices,
+@@ -1492,6 +3117,7 @@ void Reducer::set_construction_logging_data(
+ c10::DDPLoggingData Reducer::get_ddp_logging_data() {
+   return *ddp_logging_data_;
+ }
++// Original Reducer
+ 
+ namespace {
+ 
+@@ -1517,6 +3143,17 @@ inline bool operator==(const BucketKey& lhs, const BucketKey& rhs) {
+ 
+ } // namespace
+ 
++bool check_expect_bucket_size(size_t cur_bucket_number) {
++  if (IIDPReducer::bucket_checker.empty()) {
++    return true;
++  }
++  size_t prev_bucket_number = IIDPReducer::bucket_checker.size();
++  if (prev_bucket_number == cur_bucket_number) {
++    return false;
++  }
++  return true;
++}
++
+ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
+     const std::vector<at::Tensor>& tensors,
+     const std::vector<size_t>& bucket_size_limits,
+diff --git a/torch/lib/c10d/reducer.hpp b/torch/lib/c10d/reducer.hpp
+index ea06276..92d65ba 100644
+--- a/torch/lib/c10d/reducer.hpp
++++ b/torch/lib/c10d/reducer.hpp
+@@ -15,11 +15,423 @@
+ #include <torch/csrc/autograd/variable.h>
+ #include <torch/csrc/distributed/autograd/context/context.h>
+ 
++#include <iostream>
++#include <condition_variable>
++
++#include <ATen/cuda/CUDAEvent.h> // For bucket's events
++
+ namespace c10d {
+ 
+ constexpr int kDefaultFirstBucketBytes = int(1024 * 1024);
+ constexpr int kDefaultBucketBytesCap = int(25 * 1024 * 1024);
+ 
++// [IIDP] Data structure for local gradient aggregation
++struct Barrier {
++  mutable std::mutex m;
++  std::condition_variable cv;
++  std::size_t size;
++  std::ptrdiff_t remaining;
++  std::ptrdiff_t phase = 0;
++
++  Barrier(std::size_t s):
++    size(s), remaining(s) {}
++
++  void arrive_and_wait() {
++    auto l = std::unique_lock<std::mutex>(m);
++    --remaining;
++    if (remaining != 0) {
++      auto myphase = phase + 1;
++      cv.wait(l, [&]{ return myphase - phase <= 0; });
++    } else {
++      remaining = size;
++      ++phase;
++      cv.notify_all();
++    }
++  }
++};
++
++class IIDPReducer {
++ public:
++  // The constructor takes a list of variables for every model replica.
++  // The bucket assignment for this reducer is specified as a list of
++  // buckets, each of which is specified as a list of indices into the
++  // variables list for **a single replica** (i.e. `variables[0]`).
++  explicit IIDPReducer(
++      std::vector<std::vector<torch::autograd::Variable>> replicas,
++      std::vector<std::vector<size_t>> bucket_indices,
++      c10::intrusive_ptr<c10d::ProcessGroup> process_group,
++      std::vector<std::vector<bool>> expect_sparse_gradients,
++      int64_t bucket_bytes_cap,
++      bool find_unused_parameters,
++      bool gradient_as_bucket_view,
++      int model_index,
++      int num_local_models,
++      int total_num_models);
++
++  ~IIDPReducer() noexcept(false);
++
++  // To (re-)initialize bucket assignment, pass a list of buckets, each
++  // of which is specified by a list of indices in the variables list.
++  // This function performs validation that the variables within a bucket
++  // all live on the same device and have the same dimensionality.
++  void initialize_buckets(std::vector<std::vector<size_t>> bucket_indices);
++
++  // This function is called when the forward function has produced an output,
++  // and the user wishes to reduce gradients in the backwards pass.
++  // If they don't, and wish to accumulate gradients before reducing them,
++  // a call to this function can simply be omitted.
++  void prepare_for_backward(
++      const std::vector<torch::autograd::Variable>& outputs);
++
++  // Returns the relative time in nanoseconds when gradients were ready,
++  // with respect to the time `prepare_for_backward` was called. The outer
++  // vector is for model replicas and the inner vector is for parameters.
++  std::vector<std::vector<int64_t>> get_backward_stats() const {
++    return backward_stats_;
++  }
++
++  // Registers a hook to the reducer. The hook is `CommHookInterface`
++  // type to allow both Python and CPP hooks. This function can only
++  // be called once before calling backward.
++ // Cannot combine with the call of `register_builtin_comm_hook`.
++  void register_comm_hook(std::unique_ptr<CommHookInterface> iface);
++
++  // Registers a built-in C++ comm hook to the reducer. This function can only
++  // be called once before calling backward.
++  // Cannot combine with the call of `register_comm_hook`.
++  void register_builtin_comm_hook(c10d::BuiltinCommHookType comm_hook_type);
++
++  // Returns a vector of tensors in each bucket in sequential order.
++  std::vector<std::vector<at::Tensor>> get_bucket_tensors() const;
++
++  // Rebuild buckets based on rebuilt_params_ and rebuilt_param_indices_
++  // according to when tensors received grads in the backward pass.
++  // TODO this function makes broadcast communication call and
++  // could be overlapped with next forward() call, thus
++  // it could be async. Will make it async when rebuilding buckets for
++  // find_unused_parameters = true case, as we could rebuild buckets more than
++  // once for find_unused_parameters = true case, where subgraphs are trained
++  // and parameter indices order may change more frequently.
++  // For find_unused_parameters = false case, buckets are only rebuilt once,
++  // the performance cost is negligible. Returns true if the buckets were
++  // rebuilt.
++  bool rebuild_buckets();
++
++  // Returns true if we should rebuild buckets, else false. We only rebuild
++  // buckets once after the first iteration and never rebuild them if
++  // find_unused_parameters_.
++  inline bool should_rebuild_buckets() const {
++    return !find_unused_parameters_ && !has_rebuilt_bucket_;
++  }
++
++  // Pushes all parameters to be rebuilt.
++  void push_rebuilt_params_for_all_indices();
++
++  std::vector<std::vector<size_t>> get_rebuilt_bucket_indices() const {
++    return rebuilt_bucket_indices_;
++  }
++
++  // Creates and sets ForwardPassWorkHandle given a ProcessGroup::Work and the
++  // corresponding tensor being reduced.
++  void set_forward_pass_work_handle(
++      c10::intrusive_ptr<c10d::ProcessGroup::Work> forwardPassWorkHandle,
++      bool useStaticWorldSize);
++
++  void reconfigure(int num_local_models, int total_num_models);
++
++  // Retrieve on-device tensors used to track locally unused parameters. For
++  // each replica, it is a tensor where index i = 1 if the Variable with that
++  // index has been used.
++  std::vector<at::Tensor> get_local_used_maps_on_device() const;
++
++  // Set logging data that can be got during DistributedDataParallel
++  // construction time.
++  void set_construction_logging_data(
++      const std::string& module_name,
++      const std::vector<int>& device_ids,
++      int output_device,
++      bool broadcast_buffers);
++
++  // An Interface for users to get DDPLoggingData and log them
++  // in the applications.
++  c10::DDPLoggingData get_ddp_logging_data();
++
++  int model_index_;
++  int num_local_models_;
++  int total_num_models_;
++
++  static std::vector<IIDPReducer*> reducer_list;
++  static std::vector<std::vector<bool>> bucket_checker;
++
++  static std::condition_variable barrier_init_condition;
++  static std::mutex barrier_init_mutex;
++  static Barrier barrier;
++
++
++ protected:
++  // Forward declaration.
++  struct Bucket;
++  // Locates a specific variable by replica index and variable index.
++  struct VariableIndex {
++    size_t replica_index;
++    size_t variable_index;
++
++    VariableIndex() = default;
++
++    VariableIndex(size_t replica_index_, size_t variable_index_) {
++      replica_index = replica_index_;
++      variable_index = variable_index_;
++    }
++  };
++
++  void push_rebuilt_params(const VariableIndex& index);
++
++  mutable std::mutex mutex_;
++  std::vector<std::vector<torch::autograd::Variable>> replicas_;
++  c10::intrusive_ptr<::c10d::ProcessGroup> process_group_;
++  std::vector<std::vector<bool>> expect_sparse_gradients_;
++
++  std::vector<std::vector<std::shared_ptr<torch::autograd::Node>>>
++      grad_accumulators_;
++  std::unordered_map<torch::autograd::Node*, std::vector<VariableIndex>>
++      gradAccToVariablesMap_;
++  std::vector<std::pair<uintptr_t, std::shared_ptr<torch::autograd::Node>>>
++      hooks_;
++
++  bool expect_autograd_hooks_;
++  bool require_finalize_;
++  size_t next_bucket_;
++
++  bool has_marked_unused_parameters_;
++  const bool find_unused_parameters_;
++  const bool gradient_as_bucket_view_;
++  std::vector<VariableIndex> unused_parameters_;
++  // Locally used parameter maps indicating if parameters are used locally
++  // during the current iteration or no_sync session if no_sync is on. One
++  // tensor for each model replica and each tensor is one-dim int32 tensor of
++  // number of parameters. These tensors are marked in autograd_hook to indicate
++  // the corresponding param has been used, and get allreduced in the end of
++  // backward of current iteration or no_sync session for figuring out the
++  // globally unused parameters.
++  //
++  // local_used_maps_:     CPU tensors for bookkeeping locally used params
++  // local_used_maps_dev_: dev tensors for reducing globally unused params
++  std::vector<at::Tensor> local_used_maps_;
++  std::vector<at::Tensor> local_used_maps_dev_;
++  // Indicate that reduction is done and D2H copy is done as well.
++  bool local_used_maps_reduced_;
++
++  // Work handle for allreduce on local_used_maps_
++  c10::intrusive_ptr<c10d::ProcessGroup::Work> local_used_work_;
++
++  void verify_replicas_within_process();
++
++  void verify_replica0_across_processes();
++
++  void mark_variable_ready_dense(VariableIndex index);
++
++  void mark_variable_ready_sparse(VariableIndex index);
++
++  void mark_variable_ready(VariableIndex index);
++
++  void autograd_hook(VariableIndex index);
++
++  void mark_bucket_ready(size_t bucket_index);
++
++  void finalize_bucket_dense(Bucket& replica);
++
++  void finalize_backward();
++
++  // Asserts that the reduction for the previous iteration has finished before
++  // rebuilding buckets or kicking off the next one.
++  void ensure_prior_reduction_finished();
++
++  // Broadcast rebuilt buckets from rank 0 to other ranks before initializing
++  // the buckets
++  void sync_bucket_indices(std::vector<std::vector<size_t>>& bucket_indices);
++
++  using GradCallback =
++      torch::distributed::autograd::DistAutogradContext::GradCallback;
++  void runGradCallbackForVariable(
++      torch::autograd::Variable& variable,
++      GradCallback&& cb);
++
++  // A bucket replica represents [1..N] gradients to be reduced,
++  // with the same dtype, on the same device.
++  //
++  // Batching gradients together before reducing them can result in lower
++  // overhead and/or faster time to completion. Only gradients of the same type
++  // and on the same device can be batched. The tensor that represents the
++  // flattened gradient uses the same type and is placed on the same device.
++  // Buckets are filled as the gradients they hold are computed (triggered by
++  // autograd hooks). Buckets are reduced in a predetermined order that is
++  // identical across processes.
++  struct BucketReplica {
++    // Flattened (1 dimensional) contents of bucket.
++    at::Tensor contents;
++
++    // Views into contents for each grad.  Each view will be created with
++    // layout (sizes + strides) matching the grad's expected layout
++    // ("Gradient Layout Contract" in torch/csrc/autograd/AccumulateGrad.h).
++    // `bucket_views_in[i].copy_(grad)` and
++    // `grad.copy_(bucket_views_out[i])`
++    // provide convenient ways to move grad data in/out of contents.
++    // The reason we keep to states for bucket_views is that if DDP
++    // communication hook was registered, `bucket_views_out` could be
++    // re-initialized with the value of hook's `future_work`. We still need to
++    // keep a separate view reference to replica's original contents for
++    // `bucket_views_in[i].copy_(grad)` call.
++    std::vector<at::Tensor> bucket_views_in;
++    std::vector<at::Tensor> bucket_views_out;
++
++    // Variables that contribute to this bucket replica. Use refcounted value
++    // here so that we can easily unflatten the bucket contents into the
++    // participating variables after reduction has completed.
++    std::vector<torch::autograd::Variable> variables;
++
++    // Per-variable offset/length into the flat bucket contents tensor and grad bucket.
++    std::vector<size_t> offsets;
++    std::vector<size_t> lengths;
++
++    // Per-variable sizes into the grad bucekt.
++    std::vector<c10::IntArrayRef> sizes_vec;
++
++    // Number of tensors to be added before this bucket is complete.
++    // This is reset to `variables.size()` every iteration.
++    size_t pending;
++    bool modified = false;
++
++    // TODO(@pietern)
++    // Memory copies from gradient tensors into the bucket are potentially
++    // done on different CUDA streams. We record an event for every copy
++    // so that we can synchronize with them prior to kicking off the reduction.
++    // std::vector<at::cuda::CUDAEvent> events;
++
++    at::cuda::CUDAEvent event;
++  };
++
++  // This function is called inside `initialize_buckets`, it initializes both
++  // bucket_views_in and bucket_views_out into the contents tensor for each
++  // variable's grad. Views serve as entry points to copy_ each grad's data
++  // in/out of the flat contents tensor.
++  void initialize_bucket_views(BucketReplica& replica, at::Tensor& contents);
++
++  // This function is called inside `finalize_backward`, it happens only if
++  // DDP communication hook was registered to recreate just bucket_views_out
++  // with the result of `future_work`.
++  void populate_bucket_views_out(BucketReplica& replica, at::Tensor& tensor);
++
++  // If gradient_as_bucket_view_ is false, after allreduce buckets,
++  // copy bucket results back to grads.
++  void copy_bucket_to_grad(
++      torch::autograd::Variable& variable,
++      IIDPReducer::BucketReplica& replica,
++      size_t intra_bucket_index,
++      bool global_unused);
++  // Check layout of grad and bucket_view before calling copy_grad_to_bucket
++  void check_grad_layout(const at::Tensor& grad, const at::Tensor& bucket_view);
++  // If gradient_as_bucket_view_ is false, before allreduce buckets,
++  // copy grads to buckets.
++  void copy_grad_to_bucket(const at::Tensor& grad, at::Tensor& bucket_view);
++
++  // A bucket holds N bucket replicas (1 per model replica).
++  //
++  // If every bucket in this struct is ready, the reduction can be kicked off.
++  // One bucket per replica. Reduction is kicked off when every bucket is ready.
++  //
++  struct Bucket {
++    std::vector<BucketReplica> replicas;
++
++    // Global indices of participating variables in the bucket
++    std::vector<size_t> variable_indices;
++
++    // Number of replicas to be marked done before this bucket is ready.
++    size_t pending;
++
++    // Keep work handle around when this set of buckets is being reduced.
++    c10::intrusive_ptr<c10d::ProcessGroup::Work> work;
++
++    // Keep future work handle around if DDP comm hook is registered.
++    c10::intrusive_ptr<torch::jit::Future> future_work;
++
++    // If this bucket should expect a single sparse gradient.
++    // Implies: replicas[i].variables.size() == 1.
++    bool expect_sparse_gradient = false;
++  };
++
++  std::vector<Bucket> buckets_;
++
++  // A variable locator locates a particular variable in the bucket
++  // structure. The `bucket_index` field points to the bucket in the `buckets_`
++  // vector. The `intra_bucket_index` field points to the index of the variable
++  // in any of the vector fields in the bucket replica.
++  struct VariableLocator {
++    // Index into the `buckets_` variable.
++    size_t bucket_index;
++    // Index of parameter in single bucket replica.
++    size_t intra_bucket_index;
++
++    VariableLocator() = default;
++
++    VariableLocator(size_t bucket_index_, size_t intra_bucket_index_) {
++      bucket_index = bucket_index_;
++      intra_bucket_index = intra_bucket_index_;
++    }
++  };
++
++  // Map the index of a variable to its location in the bucket structure.
++  std::vector<VariableLocator> variable_locators_;
++
++  // We collect the relative timestamp of every gradient being ready
++  // when executing autograd. This can be used to derive a timeline of
++  // the point in time buckets were ready, or ideal bucket assignment/ordering.
++  int64_t backward_stats_base_;
++  std::vector<std::vector<int64_t>> backward_stats_;
++
++  // Following variables are to help build dynamic bucket order
++  bool has_rebuilt_bucket_;
++  std::vector<at::Tensor> rebuilt_params_;
++  std::vector<int64_t> rebuilt_param_indices_;
++  const int64_t bucket_bytes_cap_;
++  std::vector<std::vector<size_t>> rebuilt_bucket_indices_;
++
++  struct RpcContext {
++    using ContextPtr = torch::distributed::autograd::ContextPtr;
++    // The shared_ptr is to hold the context instance.
++    ContextPtr context_ptr_holder;
++    std::atomic<ContextPtr::element_type*> context_ptr{nullptr};
++
++    void set(ContextPtr&& new_context_ptr);
++  };
++  RpcContext rpc_context_;
++
++  // A struct containing work handle and tensor for allreduce scheduled in
++  // forward pass, if applicable.
++  struct ForwardPassAllreduceWork {
++    c10::intrusive_ptr<c10d::ProcessGroup::Work> workHandle;
++    at::Tensor resultTensor;
++    // whether we should divide by the initial world_size or the no. of
++    // remaining DDP ranks.
++    bool useStaticWorldSize;
++  };
++
++  // Handle for the currently scheduled allreduce in the forward pass, if
++  // applicable.
++  ForwardPassAllreduceWork forwardPassWorkHandle_;
++
++  // Division factor for reduction of gradients.
++  int divFactor_;
++
++ private:
++  // comm_hook_ is used to access the DDP communication hook if registered.
++  std::unique_ptr<CommHookInterface> comm_hook_;
++
++  // ddp_logging_data_ is used to hold all the ddp related logging
++  // data fields.
++  std::unique_ptr<c10::DDPLoggingData> ddp_logging_data_;
++};
++
++
+ class Reducer {
+  public:
+   // The constructor takes a list of variables for every model replica.
+diff --git a/torch/nn/parallel/__init__.py b/torch/nn/parallel/__init__.py
+index 4c28310..295eb3f 100644
+--- a/torch/nn/parallel/__init__.py
++++ b/torch/nn/parallel/__init__.py
+@@ -2,10 +2,10 @@ from .parallel_apply import parallel_apply
+ from .replicate import replicate
+ from .data_parallel import DataParallel, data_parallel
+ from .scatter_gather import scatter, gather
+-from .distributed import DistributedDataParallel
++from .distributed import DistributedDataParallel, IndependentIdenticalDataParallel
+ 
+ __all__ = ['replicate', 'scatter', 'parallel_apply', 'gather', 'data_parallel',
+-           'DataParallel', 'DistributedDataParallel']
++           'DataParallel', 'DistributedDataParallel', 'IndependentIdenticalDataParallel']
+ 
+ def DistributedDataParallelCPU(*args, **kwargs):
+     import warnings
+diff --git a/torch/nn/parallel/distributed.py b/torch/nn/parallel/distributed.py
+index ff7af61..6238e28 100644
+--- a/torch/nn/parallel/distributed.py
++++ b/torch/nn/parallel/distributed.py
+@@ -26,6 +26,8 @@ from .parallel_apply import parallel_apply
+ from torch._utils import _get_device_index, _get_all_device_indices
+ from ._functions import _get_stream
+ 
++local_DDP_list = {}
++
+ 
+ def _find_tensors(obj):
+     r"""
+@@ -108,6 +110,859 @@ class _DDPUnevenInputsConfig(NamedTuple):
+     ddp_join_divide_by_initial_world_size: bool
+ 
+ 
++class IndependentIdenticalDataParallel(Module):
++    def __init__(self, module, device_ids=None,
++                 output_device=None, dim=0, broadcast_buffers=True,
++                 process_group=None,
++                 bucket_cap_mb=25,
++                 find_unused_parameters=False,
++                 check_reduction=False,
++                 gradient_as_bucket_view=False,
++                 model_index=0,
++                 broadcast_master=0,
++                 num_local_models=1,
++                 total_num_models=1,
++                 sync_buffer_barrier=[None, None]):
++
++        super(IndependentIdenticalDataParallel, self).__init__()
++
++        assert any((p.requires_grad for p in module.parameters())), (
++            "IndependentIdenticalDataParallel is not needed when a module "
++            "doesn't have any parameter that requires a gradient."
++        )
++
++        self.model_index = model_index
++        self.broadcast_master = broadcast_master
++        self.num_local_models = num_local_models
++        self.total_num_models = total_num_models
++        if model_index == 0:
++            global local_DDP_list
++            local_DDP_list['0'] = self
++        #local_DDP_list[str(model_index)] = self
++        # It is used for '_create_optimizer_hook()' in torch/cuda/trainer.py
++        self.bucket_indices = []
++        self.ddp_register_params = []
++        self._has_rebuilt_buckets = False
++
++        self.sync_buffer_barrier = sync_buffer_barrier
++        if self.num_local_models > 1 and not self.sync_buffer_barrier[0]:
++            raise ValueError(
++                "If number of local models > 1, then sync_buffer_barrier must be configured.")
++
++        self.is_multi_device_module = len({p.device for p in module.parameters()}) > 1
++        distinct_device_types = {p.device.type for p in module.parameters()}
++        assert len(distinct_device_types) == 1, (
++            "IndependentIdenticalDataParallel's input module must be on "
++            "the same type of devices, but input module parameters locate in {}."
++        ).format(distinct_device_types)
++        self.device_type = list(distinct_device_types)[0]
++
++        if self.device_type == "cpu" or self.is_multi_device_module:
++            assert not device_ids and not output_device, (
++                "IndependentIdenticalDataParallel device_ids and output_device arguments "
++                "only work with single-device GPU modules, but got "
++                "device_ids {}, output_device {}, and module parameters {}."
++            ).format(device_ids, output_device, {p.device for p in module.parameters()})
++
++            self.device_ids = None
++            self.output_device = None
++        else:
++            # Use all devices by default for single-device GPU modules
++            if device_ids is None:
++                device_ids = _get_all_device_indices()
++
++            self.device_ids = [_get_device_index(x, True) for x in device_ids]
++
++            if output_device is None:
++                output_device = device_ids[0]
++
++            self.output_device = _get_device_index(output_device, True)
++
++        if process_group is None:
++            self.process_group = _get_default_group()
++        else:
++            self.process_group = process_group
++
++        self.dim = dim
++        self.module = module
++        self.device = list(self.module.parameters())[0].device
++        self.broadcast_buffers = broadcast_buffers
++        self.find_unused_parameters = find_unused_parameters
++        self.require_backward_grad_sync = True
++        self.require_forward_param_sync = True
++        self.ddp_uneven_inputs_config = _DDPUnevenInputsConfig(
++            ddp_join_enabled=False, ddp_join_divide_by_initial_world_size=False
++        )
++        self.gradient_as_bucket_view = gradient_as_bucket_view
++        if hasattr(module, '_ddp_params_and_buffers_to_ignore'):
++            self.parameters_to_ignore = module._ddp_params_and_buffers_to_ignore
++        else:
++            self.parameters_to_ignore = []
++
++        if check_reduction:
++            # This argument is no longer used since the reducer
++            # will ensure reduction completes even if some parameters
++            # do not receive gradients.
++            warnings.warn(
++                "The `check_reduction` argument in `IndependentIdenticalDataParallel` "
++                "module is deprecated. Please avoid using it."
++            )
++            pass
++
++        # Check that a module does not have Uninitialized parameters
++        for param in module.parameters():
++            if isinstance(param, torch.nn.parameter.UninitializedParameter):
++                raise RuntimeError(
++                    'Modules with uninitialized parameters can\'t be used with `IndependentIdenticalDataParallel`. '
++                    'Run a dummy forward pass to correctly initialize the modules')
++        # used for intra-node param sync and inter-node sync as wel
++        self.broadcast_bucket_size = int(250 * 1024 * 1024)
++
++        # reduction bucket size
++        self.bucket_bytes_cap = int(bucket_cap_mb * 1024 * 1024)
++        # Whether to perform input tensor CPU to GPU copies on a side-stream
++        self.use_side_stream_for_tensor_copies = os.environ.get("PYTORCH_DDP_USE_SIDE_STREAM", "1") == "1"
++
++        # Sync params and buffers
++        self._sync_params_and_buffers(authoritative_rank=0)
++
++        self._ddp_init_helper()
++
++    def _sync_params_and_buffers(self, authoritative_rank=0):
++        module_states = []
++        for name, param in self.module.state_dict().items():
++            if name not in self.parameters_to_ignore:
++                module_states.append(param)
++
++        if len(module_states) > 0:
++            if self.model_index == 0:
++                self._distributed_broadcast_coalesced(
++                    module_states,
++                    self.broadcast_bucket_size,
++                    authoritative_rank)
++            else:
++                local_master = local_DDP_list['0']
++                #self.module.load_state_dict(local_master.module.state_dict())
++                for (name, param), (_, main_param) in zip(
++                        self.module.state_dict().items(), local_master.module.state_dict().items()):
++                    if name not in self.parameters_to_ignore:
++                        param.data.copy_(main_param.data)
++                torch.cuda.synchronize()
++
++
++    def _ddp_init_helper(self):
++        """
++        Initialization helper function that does the following:
++
++        (1) replicating the module from device[0] to the other devices
++        (2) bucketing the parameters for reductions
++        (3) resetting the bucketing states
++        (4) registering the grad hooks
++        (5) passing a handle of DDP to SyncBatchNorm Layer
++        """
++
++        def parameters(m, recurse=True):
++            def model_parameters(m):
++                ps = m._former_parameters.values() \
++                    if hasattr(m, "_former_parameters") \
++                    else m.parameters(recurse=False)
++                for p in ps:
++                    yield p
++
++            for m in m.modules() if recurse else [m]:
++                for p in model_parameters(m):
++                    yield p
++
++        if self.device_ids and len(self.device_ids) > 1:
++
++            warnings.warn(
++                "Single-Process Multi-GPU is not the recommended mode for "
++                "DDP. In this mode, each DDP instance operates on multiple "
++                "devices and creates multiple module replicas within one "
++                "process. The overhead of scatter/gather and GIL contention "
++                "in every forward pass can slow down training. "
++                "Please consider using one DDP instance per device or per "
++                "module replica by explicitly setting device_ids or "
++                "CUDA_VISIBLE_DEVICES. "
++            )
++
++            # only create replicas for single-device CUDA modules
++            #
++            # TODO: we don't need to replicate params in here. they're always going to
++            # be broadcasted using larger blocks in broadcast_coalesced, so it might be
++            # better to not pollute the caches with these small blocks
++            self._module_copies = replicate(self.module, self.device_ids, detach=True)
++            self._module_copies[0] = self.module
++
++            for module_copy in self._module_copies[1:]:
++                for param, copy_param in zip(self.module.parameters(), parameters(module_copy)):
++                    # Reducer requires param copies have the same strides across replicas.
++                    # Fixes up copy_param strides in case replicate didn't match param strides.
++                    if param.layout is torch.strided and param.stride() != copy_param.stride():
++                        with torch.no_grad():
++                            copy_param.set_(copy_param.clone()
++                                                      .as_strided(param.size(), param.stride())
++                                                      .copy_(copy_param))
++                    copy_param.requires_grad = param.requires_grad
++
++        else:
++            self._module_copies = [self.module]
++
++        self.modules_params = [list(parameters(m)) for m in self._module_copies]
++        # Collect buffers for modules, filtering out buffers that should be ignored.
++        named_module_buffers = [
++            [(buffer, buffer_name) for buffer_name, buffer in m.named_buffers()]
++            for m in self._module_copies
++        ]
++        self.modules_buffers = [
++            [
++                buffer
++                for (buffer, buffer_name) in module_buffers
++                if buffer_name not in self.parameters_to_ignore
++            ]
++            for module_buffers in named_module_buffers
++        ]
++        # Build tuple of (module, parameter) for all parameters that require grads.
++        if self.device_ids and len(self.device_ids) > 1:
++            # Single-process multi-device mode,does not support self.parameters_to_ignore.
++            if self.parameters_to_ignore:
++                raise ValueError(
++                    "Single-Process multi-device mode does not "
++                    "support ignoring parameters upfront. Please consider "
++                    "using one DDP instance per device."
++                )
++
++            modules_and_parameters = [
++                [
++                    (module, parameter)
++                    for module in replica.modules()
++                    for parameter in filter(
++                        lambda parameter: parameter.requires_grad,
++                        parameters(module, recurse=False))
++                ] for replica in self._module_copies]
++        else:
++            modules_and_parameters = [
++                [
++                    (module, parameter)
++                    for module_name, module in replica.named_modules()
++                    for parameter in [
++                        param
++                        # Note that we access module.named_parameters instead of
++                        # parameters(module). parameters(module) is only needed in the
++                        # single-process multi device case, where it accesses replicated
++                        # parameters through _former_parameters.
++                        for param_name, param in module.named_parameters(recurse=False)
++                        if param.requires_grad
++                        and f"{module_name}.{param_name}" not in self.parameters_to_ignore
++                    ]
++                ]
++                for replica in self._module_copies
++            ]
++
++        # Build list of parameters.
++        parameters = [
++            list(parameter for _, parameter in replica)
++            for replica in modules_and_parameters]
++
++        # Checks if a module will produce a sparse gradient.
++        def produces_sparse_gradient(module):
++            if isinstance(module, torch.nn.Embedding):
++                return module.sparse
++            if isinstance(module, torch.nn.EmbeddingBag):
++                return module.sparse
++            return False
++
++        # Build list of booleans indicating whether or not to expect sparse
++        # gradients for the corresponding parameters.
++        expect_sparse_gradient = [
++            list(produces_sparse_gradient(module) for module, _ in replica)
++            for replica in modules_and_parameters]
++
++        # To assign an index of actual parameter in a gradient bucket
++        for index, param in enumerate(parameters[0]):
++            param.index = index
++        # The bucket size limit is specified in the constructor.
++        # Additionally, we allow for a single small bucket for parameters
++        # that are defined first, such that their gradients don't spill into
++        # a much larger bucket, adding unnecessary latency after gradient
++        # computation finishes. Experiments showed 1MB is a reasonable value.
++        bucket_indices = dist._compute_bucket_assignment_by_size(
++            parameters[0],
++            [dist._DEFAULT_FIRST_BUCKET_BYTES, self.bucket_bytes_cap],
++            expect_sparse_gradient[0])
++        self.bucket_indices = list(reversed(bucket_indices))
++        if self.model_index == 0:
++            if dist.get_rank() == 0:
++                print(
++                    f'[INFO][IndependentIdenticalDataParallel] '
++                    f'model index: 0 | self.bucket_indices: {self.bucket_indices}',
++                )
++        # Note: reverse list of buckets because we want to approximate the
++        # order in which their gradients are produced, and assume they
++        # are used in the forward pass in the order they are defined.
++        self.reducer = dist.IIDPReducer(
++            parameters,
++            list(reversed(bucket_indices)),
++            self.process_group,
++            expect_sparse_gradient,
++            self.bucket_bytes_cap,
++            self.find_unused_parameters,
++            self.gradient_as_bucket_view,
++            self.model_index,
++            self.num_local_models,
++            self.total_num_models)
++
++        self.ddp_register_params = parameters[0]
++
++        # Set logging data that can be got during construction time.
++        dist._set_construction_logging_data(
++            self.reducer,
++            self.module.__class__.__name__,
++            [] if self.device_ids is None else self.device_ids,
++            -1 if self.output_device is None else self.output_device,
++            self.broadcast_buffers)
++
++        # passing a handle to torch.nn.SyncBatchNorm layer
++        self._passing_sync_batchnorm_handle(self._module_copies)
++
++    def __getstate__(self):
++        self._check_default_group()
++        attrs = copy.copy(self.__dict__)
++        del attrs['process_group']
++        del attrs['reducer']
++        return attrs
++
++    def __setstate__(self, state):
++        # If serializable, then the process group should be the default one
++        self.process_group = _get_default_group()
++        super(IndependentIdenticalDataParallel, self).__setstate__(state)
++        self.__dict__.setdefault('require_forward_param_sync', True)
++        self.__dict__.setdefault('require_backward_grad_sync', True)
++        self._ddp_init_helper()
++
++    def _check_default_group(self):
++        pickle_not_supported = False
++        try:
++            if self.process_group != _get_default_group():
++                pickle_not_supported = True
++        except RuntimeError:
++            pickle_not_supported = True
++
++        if pickle_not_supported:
++            raise RuntimeError("DDP Pickling/Unpickling are only supported "
++                               "when using DDP with the default process "
++                               "group. That is, when you have called "
++                               "init_process_group and have not passed "
++                               "process_group argument to DDP constructor")
++
++    @contextmanager
++    def no_sync(self):
++        r"""
++        A context manager to disable gradient synchronizations across DDP
++        processes. Within this context, gradients will be accumulated on module
++        variables, which will later be synchronized in the first
++        forward-backward pass exiting the context.
++
++        Example::
++
++            >>> ddp = torch.nn.parallel.IndependentIdenticalDataParallel(model, pg)
++            >>> with ddp.no_sync():
++            >>>   for input in inputs:
++            >>>     ddp(input).backward()  # no synchronization, accumulate grads
++            >>> ddp(another_input).backward()  # synchronize grads
++        """
++        old_require_backward_grad_sync = self.require_backward_grad_sync
++        self.require_backward_grad_sync = False
++        try:
++            yield
++        finally:
++            self.require_backward_grad_sync = old_require_backward_grad_sync
++
++    def reconfigure(self, num_local_models, total_num_models, sync_buffer_barrier):
++        self.num_local_models = num_local_models
++        self.total_num_models = total_num_models
++        self.sync_buffer_barrier = sync_buffer_barrier
++        self.reducer.reconfigure(self.num_local_models, self.total_num_models)
++
++    def forward(self, *inputs, **kwargs):
++        if self.ddp_uneven_inputs_config.ddp_join_enabled:
++            ones = torch.ones(
++                1, device=self.device
++            )
++            work = dist.all_reduce(ones, group=self.process_group, async_op=True)
++            self.reducer._set_forward_pass_work_handle(
++                work, self.ddp_uneven_inputs_config.ddp_join_divide_by_initial_world_size
++            )
++
++        # Calling _rebuild_buckets before forward compuation,
++        # It may allocate new buckets before deallocating old buckets
++        # inside _rebuild_buckets. To save peak memory usage,
++        # call _rebuild_buckets before the peak memory usage increases
++        # during forward computation.
++        # This should be called only once during whole training period.
++        if self.reducer._rebuild_buckets():
++            logging.info("Reducer buckets have been rebuilt in this iteration.")
++            self._has_rebuilt_buckets = True
++            self.bucket_indices = self.reducer.get_rebuilt_bucket_indices()
++            if self.model_index == 0:
++                if dist.get_rank() == 0:
++                    print(
++                        f'[INFO][IndependentIdenticalDataParallel] '
++                        f'model index: 0 | rebuild => self.bucket_indices: {self.bucket_indices}',
++                    )
++        if self.require_forward_param_sync:
++            self._sync_params()
++        if self.ddp_uneven_inputs_config.ddp_join_enabled:
++            # Notify joined ranks whether they should sync in backwards pass or not.
++            self._check_global_requires_backward_grad_sync(is_joined_rank=False)
++        if self.device_ids:
++            if len(self.device_ids) == 1:
++                inputs, kwargs = self.to_kwargs(inputs, kwargs, self.device_ids[0])
++                output = self.module(*inputs[0], **kwargs[0])
++            else:
++                inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
++                outputs = self.parallel_apply(self._module_copies[:len(inputs)], inputs, kwargs)
++                output = self.gather(outputs, self.output_device)
++        else:
++            output = self.module(*inputs, **kwargs)
++        if torch.is_grad_enabled() and self.require_backward_grad_sync:
++            self.require_forward_param_sync = True
++            # We'll return the output object verbatim since it is a freeform
++            # object. We need to find any tensors in this object, though,
++            # because we need to figure out which parameters were used during
++            # this forward pass, to ensure we short circuit reduction for any
++            # unused parameters. Only if `find_unused_parameters` is set.
++            if self.find_unused_parameters:
++                self.reducer.prepare_for_backward(list(_find_tensors(output)))
++            else:
++                self.reducer.prepare_for_backward([])
++        else:
++            self.require_forward_param_sync = False
++
++        return output
++
++    def scatter(self, inputs, kwargs, device_ids):
++        return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
++
++    def _recursive_to(self, inputs, target_gpu):
++        r"""
++        Recursively moves input to the target_gpu.
++        """
++        def to_map(obj):
++            if isinstance(obj, torch.Tensor):
++                if not self.use_side_stream_for_tensor_copies:
++                    return (obj.to(target_gpu), )
++                else:
++                    # Perform CPU -> GPU copies in a background stream. This code is
++                    # motivated from similar logic in torch/nn/parallel/_functions.py
++                    stream = _get_stream(target_gpu)
++                    with torch.cuda.stream(stream):
++                        output = obj.to(target_gpu)
++                    # synchronize with the copy stream
++                    with torch.cuda.device(target_gpu):
++                        current_stream = torch.cuda.current_stream()
++                        # Sync the current stream with the copy stream
++                        current_stream.wait_stream(stream)
++                        # Ensure tensor memory is not reused until work on
++                        # main stream is complete
++                        output.record_stream(current_stream)
++                    return (output, )
++            if is_namedtuple(obj):
++                return [type(obj)(*args) for args in zip(*map(to_map, obj))]
++            if isinstance(obj, tuple) and len(obj) > 0:
++                return list(zip(*map(to_map, obj)))
++            if isinstance(obj, list) and len(obj) > 0:
++                return [list(i) for i in zip(*map(to_map, obj))]
++            if isinstance(obj, dict) and len(obj) > 0:
++                return [type(obj)(i) for i in zip(*map(to_map, obj.items()))]
++            return [obj]
++
++        # Avoid reference cycle
++        try:
++            res = to_map(inputs)
++        finally:
++            to_map = None
++        return res
++
++    def to_kwargs(self, inputs, kwargs, device_id):
++        inputs = self._recursive_to(inputs, device_id) if inputs else []
++        kwargs = self._recursive_to(kwargs, device_id) if kwargs else []
++        if len(inputs) < len(kwargs):
++            inputs.extend([() for _ in range(len(kwargs) - len(inputs))])
++        elif len(kwargs) < len(inputs):
++            kwargs.extend([{} for _ in range(len(inputs) - len(kwargs))])
++        inputs = tuple(inputs)
++        kwargs = tuple(kwargs)
++        return inputs, kwargs
++
++    def parallel_apply(self, replicas, inputs, kwargs):
++        return parallel_apply(replicas, inputs, kwargs, self.device_ids[:len(replicas)])
++
++    def gather(self, outputs, output_device):
++        return gather(outputs, output_device, dim=self.dim)
++
++    def train(self, mode=True):
++        super(IndependentIdenticalDataParallel, self).train(mode)
++        for module in self._module_copies[1:]:
++            module.train(mode)
++        return self
++
++    def get_ddp_logging_data(self):
++        return dist._get_ddp_logging_data(self.reducer)
++
++    # When running in join mode, schedules an allreduce to match the one in the
++    # forward pass to determine the no. of currently active processes and whether
++    # all processes have joined.
++    def _schedule_shadow_all_reduce_for_fwd_pass(self):
++        all_active_procs = torch.zeros(
++            1, device=self.device
++        )
++        dist.all_reduce(all_active_procs, group=self.process_group)
++        return all_active_procs.item()
++
++    # When running in join mode, schedules an allreduce to notify joined ranks
++    # of whether backwards pass synchronization will run this iteraton or not.
++    def _check_global_requires_backward_grad_sync(self, is_joined_rank):
++        if not is_joined_rank and self.require_backward_grad_sync:
++            requires_sync_tensor = torch.ones(1, device=self.device)
++        else:
++            requires_sync_tensor = torch.zeros(1, device=self.device)
++
++        work = dist.all_reduce(
++            requires_sync_tensor, group=self.process_group, async_op=True
++        )
++        return work, requires_sync_tensor
++
++    # When running in join mode, checks and performs sync of module buffers if
++    # the models have buffers that should be synchronized in the forward pass.
++    def _check_and_sync_module_buffers(self):
++        if self.will_sync_module_buffers():
++            my_rank = dist.get_rank(self.process_group)
++            authoritative_rank = self._find_common_rank(my_rank, False)
++            if self.model_index > 0:
++                assert(False)
++            self._distributed_broadcast_coalesced(
++                self.modules_buffers[0], self.broadcast_bucket_size, authoritative_rank
++            )
++
++    # When running in join model, agrees upon a common rank and broadcast model
++    # parameters to all other ranks.
++    def _sync_final_model(self, is_last_joiner):
++        # Agree upon the process that will be the authoritative model copy.
++        # The current rank is a candidate for being the authoritative copy if
++        # is_last_joiner=True. We break ties via picking the larger rank.
++        my_rank = dist.get_rank(self.process_group)
++        self._authoritative_rank = self._find_common_rank(my_rank, is_last_joiner)
++        self._sync_params_and_buffers(authoritative_rank=self._authoritative_rank)
++
++    # Schedule allreduce ops to match those scheduled in the reducer's backward
++    # pass.
++    def _match_all_reduce_for_bwd_pass(self):
++        allreduce_work = []
++        # Schedule allreduce in the same order as Reducer schedules them, i.e.
++        # the order of the buckets. Retrieving the bucket order from the reducer
++        # ensures that we keep the same order in join mode, such as when bucket
++        # order is rebuilt dynamically.
++        all_bucket_tensors = self.reducer.get_bucket_tensors()
++        for bucket_tensors in all_bucket_tensors:
++            # Joined processes contribute zero gradient. In the case that
++            # divide_by_initial_world_size=True, we divide grads by the static
++            # world size, if not, the dividing factor is reduced by the number
++            # of joined processes.
++            zero_tensors = [
++                torch.zeros_like(t) for t in bucket_tensors
++            ]
++            work = self.process_group.allreduce(zero_tensors)
++            allreduce_work.append(work)
++        for work in allreduce_work:
++            work.wait()
++
++    # Allreduces the used parameter mapping across ranks.
++    def _match_unused_params_allreduce(self):
++        locally_used_param_maps = self.reducer._get_local_used_maps()
++        self.process_group.allreduce(locally_used_param_maps)
++
++    @contextmanager
++    def join(self, divide_by_initial_world_size=True, enable=True):
++        raise NotImplementedError
++
++    def register_comm_hook(self, state: object, hook: callable):
++        r"""
++        Registers a communication hook which is an enhancement that provides a
++        flexible hook to users where they can specify how DDP aggregates gradients
++        across multiple workers.
++
++        This hook would be very useful for researchers to try out new ideas. For
++        example, this hook can be used to implement several algorithms like GossipGrad
++        and gradient compression which involve different communication strategies for
++        parameter syncs while running Distributed DataParallel training.
++
++        Args:
++            state (object): Passed to the hook to maintain any state information during the training process.
++                            Examples include error feedback in gradient compression,
++                            peers to communicate with next in GossipGrad, etc.
++
++                            It is locally stored by each worker
++                            and shared by all the gradient tensors on the worker.
++            hook (callable): Averages gradient tensors across workers and defined as:
++                             ``hook(state: object, bucket: dist._GradBucket) -> torch.futures.Future``:
++
++                             This function is called once the bucket is ready. The
++                             hook can perform whatever processing is needed and return
++                             a Future indicating completion of any async work (ex: allreduce).
++                             If the hook doesn't perform any communication, it can also
++                             just return a completed Future. The Future should hold the
++                             new value of grad bucket's tensors. Once a bucket is ready,
++                             c10d reducer would call this hook and use the tensors returned
++                             by the Future and copy grads to individual parameters.
++
++                             We also provide an API called ``get_future`` to retrieve a
++                             Future associated with the completion of ``c10d.ProcessGroup.work``.
++
++        .. warning ::
++            Grad bucket's tensors will not be predivided by world_size. User is responsible
++            to divide by the world_size in case of operations like allreduce.
++
++        .. warning ::
++            DDP communication hook can only be registered once and should be registered
++            before calling backward.
++
++        .. warning ::
++            The Future object that hook returns should contain a result that has the same
++            shape with the tensors inside grad bucket.
++
++        .. warning ::
++            DDP communication hook does not support single-process multiple-device mode.
++            Gradbucket tensors should consist of only a single tensor.
++
++        .. warning ::
++            ``get_future`` API supports only NCCL backend and will return a ``torch._C.Future``
++            which is an internal type and should be used with caution. It can still be used by
++            ``register_comm_hook`` API, but it is subject to some subtle differences compared
++            to ``torch.futures.Future``.
++
++        .. warning ::
++            DDP communication hook is experimental and subject to change.
++
++        Example::
++            Below is an example of a noop hook that returns the same tensors.
++
++            >>> def noop(state: object, bucket: dist._GradBucket): -> torch.futures.Future
++            >>>     fut = torch.futures.Future()
++            >>>     fut.set_result(bucket.get_tensors())
++            >>>     return fut
++
++            >>> ddp.register_comm_hook(state = None, hook = noop)
++
++        Example::
++            Below is an example of a Parallel SGD algorithm where gradients are encoded before
++            allreduce, and then decoded after allreduce.
++
++            >>> def encode_and_decode(state: object, bucket: dist._GradBucket): -> torch.futures.Future
++            >>>     tensors = [t / process_group.world_size for t in bucket.get_tensors()]
++            >>>     encoded_tensors = encode(tensors) # encode gradients
++            >>>     fut = process_group.allreduce(encoded_tensors).get_future()
++            >>>     # Define the then callback to decode.
++            >>>     def decode(fut):
++            >>>         decoded_tensors = decode(fut.value()) # decode gradients
++            >>>         return decoded_tensors
++            >>>     return fut.then(decode)
++
++            >>> ddp.register_comm_hook(state = None, hook = encode_and_decode)
++        """
++        self._check_comm_hook(hook)
++        dist._register_iidp_comm_hook(self.reducer, state, hook)
++
++    def _register_builtin_comm_hook(
++        self, comm_hook_type
++    ):
++        r"""
++        Registers a built-in communication hook that specifies how DDP
++        aggregates gradients across multiple workers.
++        The built-in hooks aim to provide efficient C++ implementations for certain hooks,
++        which might not be as efficient if implemented in Python using a Python communication hook.
++
++        Args:
++            comm_hook_type (dist.BuiltinCommHookType): type of communication hook, such as
++            ALLREDUCE, FP16_COMPRESS, etc.
++
++        .. warning ::
++            DDP communication hook can only be registered once and should be registered
++            before calling backward.
++
++        .. warning ::
++            DDP communication hook does not support single-process multiple-device mode.
++            Gradbucket tensors should consist of only a single tensor.
++
++        .. warning ::
++            DDP communication hook is experimental and subject to change.
++
++        Example::
++            Below is an example of a FP16 compression where gradients are
++            compressed into 16-bit floating-point numbers before allreduce, and
++            then decompressed after allreduce.
++
++            >>> ddp._register_builtin_comm_hook(dist.BuiltinCommHookType.FP16_COMPRESS)
++
++        """
++        dist._register_builtin_comm_hook(self.reducer, comm_hook_type)
++
++    def _distributed_broadcast_coalesced(
++        self, tensors, buffer_size, authoritative_rank=0
++    ):
++        if self.model_index > 0:
++            assert(False)
++        dist._broadcast_coalesced(
++            self.process_group, tensors, buffer_size, authoritative_rank
++        )
++
++    def will_sync_module_buffers(self):
++        return (
++            self.require_forward_param_sync
++            and self.broadcast_buffers
++            and len(self.modules_buffers[0]) > 0
++        )
++
++    def _find_common_rank(self, input_rank, rank_cond):
++        # -1 indicates that this rank is not under consideration to be the
++        # common_rank
++        rank_to_use = torch.tensor(
++            [input_rank if rank_cond else -1],
++            device=self.device,
++        )
++        dist.all_reduce(rank_to_use, op=ReduceOp.MAX, group=self.process_group)
++        if rank_to_use.item() == -1:
++            raise ValueError(
++                "BUG! Expected rank_cond to be true for at least one process."
++            )
++        return rank_to_use.item()
++
++    def _sync_buffers(self):
++        local_master = local_DDP_list['0']
++        for _buffer, _master in zip(self.modules_buffers[0], local_master.modules_buffers[0]):
++            _buffer.copy_(_master)
++
++    def _sync_params(self):
++        with torch.no_grad():
++            # only do intra-node parameters sync for replicated single-device
++            # CUDA modules
++            if self.device_ids and len(self.device_ids) > 1:
++                # intra-node parameter sync
++                if self.model_index > 0:
++                    assert(False)
++                result = comm.broadcast_coalesced(
++                    self.modules_params[0],
++                    self.device_ids,
++                    self.broadcast_bucket_size)
++                for tensors, module_params in zip(result[1:],
++                                                  self.modules_params[1:]):
++                    for tensor, param in zip(tensors, module_params):
++                        # Formerly, this spot used param.set_(tensor) to steal tensor's
++                        # data without a deep copy.  Unfortunately, that wiped out the
++                        # allreduce hook attached to param's AccumulateGrad function,
++                        # likely causing https://github.com/pytorch/pytorch/issues/37079.
++                        # TODO:  If set_ becomes safe to use here, use set_.
++                        # Otherwise, find another way to steal tensor's data.
++                        param.copy_(tensor)
++                        # Assume we have just run the optimizer and zeroed the
++                        # grads of the parameters on the root model. We need
++                        # to zero the grads on all model replicas as well.
++                        # This snippet is copied from torch.optim.Optimizer.
++                        if param.grad is not None:
++                            if param.grad.grad_fn is not None:
++                                param.grad.detach_()
++                            else:
++                                param.grad.requires_grad_(False)
++                            param.grad.zero_()
++
++            # module buffer sync
++            if self.will_sync_module_buffers():
++                # Synchronize buffers across processes.
++                # If we are running DDP with the join manager, we have to agree
++                # upon a rank to sync module buffers from, since rank 0 may
++                # already have been joined and have stale module buffers.
++                if self.ddp_uneven_inputs_config.ddp_join_enabled:
++                    authoritative_rank = self._find_common_rank(dist.get_rank(), True)
++                else:
++                    # The process with rank 0 is considered the authoritative copy.
++                    authoritative_rank = self.broadcast_master
++
++                if self.model_index == 0:
++                    self._distributed_broadcast_coalesced(
++                            self.modules_buffers[0],
++                            self.broadcast_bucket_size,
++                            authoritative_rank,
++                    )
++                    torch.cuda.synchronize()
++                    # only do intra-node buffer sync for replicated single-device
++                    # CUDA modules
++                    if self.device_ids and len(self.device_ids) > 1:
++                        # intra-node buffer sync
++                        result = comm.broadcast_coalesced(
++                            self.modules_buffers[0],
++                            self.device_ids,
++                            self.broadcast_bucket_size)
++                        for tensors, module_buffers in zip(result[1:],
++                                                           self.modules_buffers[1:]):
++                            for tensor, buffer in zip(tensors, module_buffers):
++                                buffer.set_(tensor)
++
++                    if self.sync_buffer_barrier[0]:
++                        self.sync_buffer_barrier[0].wait()
++                else:
++                    if self.sync_buffer_barrier[0]:
++                        self.sync_buffer_barrier[0].wait()
++                    self._sync_buffers()
++
++                if self.sync_buffer_barrier[1]:
++                    self.sync_buffer_barrier[1].wait()
++                """
++                local_master = local_DDP_list['0']
++                #for cur_tensor, main_tensor in zip(self.module.parameters(), local_master.module.parameters()):
++                for cur_tensor, main_tensor in zip(self.module.buffers(), local_master.module.buffers()):
++                    if not torch.equal(cur_tensor, main_tensor):
++                        raise RuntimeError("Tensor is not synchronized!")
++                """
++
++    def _passing_sync_batchnorm_handle(self, module_copies):
++        for dev_idx, module in enumerate(module_copies):
++            for layer in module.modules():
++                if isinstance(layer, torch.nn.modules.SyncBatchNorm):
++                    assert self.device_type != 'cpu', "SyncBatchNorm layers only work with GPU modules"
++                    layer._specify_ddp_gpu_num(
++                        len(self.device_ids) if self.device_ids else 1)
++
++    def _check_comm_hook(self, hook):
++        if not callable(hook):
++            raise TypeError("Communication hook must be callable.")
++
++        sig = inspect.signature(hook)
++        if (
++            sig.parameters["bucket"].annotation != inspect._empty
++            and sig.parameters["bucket"].annotation != dist._GradBucket
++        ):
++            raise ValueError(
++                "Communication hook: bucket annotation should be dist._GradBucket."
++            )
++
++        if sig.return_annotation != inspect._empty and (
++            sig.return_annotation != torch.futures.Future
++            and sig.return_annotation != torch._C.Future
++        ):
++            raise ValueError(
++                "Communication hook: return annotation should be torch.futures.Future or torch._C.Future."
++            )
++
++    @staticmethod
++    def _set_params_and_buffers_to_ignore_for_model(
++        module, params_and_buffers_to_ignore
++    ):
++        # This is a workaround to set parameters and buffers DDP should ignore
++        # during synchronization. It will be removed when the API is finalized
++        # as part of addressing https://github.com/pytorch/pytorch/issues/43690.
++        module._ddp_params_and_buffers_to_ignore = params_and_buffers_to_ignore
++
++
+ class DistributedDataParallel(Module):
+     r"""Implements distributed data parallelism that is based on
+     ``torch.distributed`` package at the module level.
+diff --git a/torch/tensor.py b/torch/tensor.py
+index fd9b60d..2e916df 100644
+--- a/torch/tensor.py
++++ b/torch/tensor.py
+@@ -192,7 +192,7 @@ class Tensor(torch._C._TensorBase):
+         # All strings are unicode in Python 3.
+         return torch._tensor_str._str(self)
+ 
+-    def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None):
++    def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None, model_index=0):
+         r"""Computes the gradient of current tensor w.r.t. graph leaves.
+ 
+         The graph is differentiated using the chain rule. If the tensor is
+@@ -242,7 +242,7 @@ class Tensor(torch._C._TensorBase):
+                 retain_graph=retain_graph,
+                 create_graph=create_graph,
+                 inputs=inputs)
+-        torch.autograd.backward(self, gradient, retain_graph, create_graph, inputs=inputs)
++        torch.autograd.backward(self, gradient, retain_graph, create_graph, inputs=inputs, model_index=model_index)
+ 
+     def register_hook(self, hook):
+         r"""Registers a backward hook.
