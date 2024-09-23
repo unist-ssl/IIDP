@@ -40,11 +40,11 @@ The original code of this example comes from [DeepLearningExamples](https://gith
   ./scripts/convergence/distributed/distributed_run.sh [node rank] [number of nodes] [local batch size] [number of VSWs] [accum step (default: 0)] [weight sync method (default: recommend)] [master (optional)] [log file (optional)]
   ```
 - Example
-  - node1
+  - node0
     ```
     ./scripts/distributed/distributed_run.sh 0 2 32 3
     ```
-  - node2
+  - node1
     ```
     ./scripts/distributed/distributed_run.sh 1 2 32 1
     ```
@@ -65,7 +65,7 @@ Generate memory profile data on each node.
 ```
 Example
 ```
-# On node1, node2
+# On node0, node1
 ./profiler/memory/scripts/run_mem_profiler.sh 32
 ```
 
@@ -80,7 +80,7 @@ GPU pause time is set to 300 seconds by default because the temperature of the G
   ```
 Example
 ```
-# On node1, node2
+# On node0, node1
 ./profiler/comp/scripts/run_comp_profiler_with_max_mem.sh mem_profile_data comp_profile_data
 ```
 
@@ -91,7 +91,7 @@ Generate profile data on each node.
 ```
 Example
 ```
-# On node1, node2
+# On node0, node1
 ./profiler/ddp_bucket/scripts/run_bucket_profiler.sh
 ```
 
@@ -104,9 +104,9 @@ After finishing the profile step on every node, execute the below script.
   ```
 Example
 ```
-# On node1, node2
-./profiler/utils/sync/sync_data_across_servers.sh mem_profile_data cluster_mem_profile_data node1 node2
-./profiler/utils/sync/sync_data_across_servers.sh comp_profile_data cluster_comp_profile_data node1 node2
+# On node0, node1
+./profiler/utils/sync/sync_data_across_servers.sh mem_profile_data cluster_mem_profile_data node0 node1
+./profiler/utils/sync/sync_data_across_servers.sh comp_profile_data cluster_comp_profile_data node0 node1
 ```
 
 ### 5. Configuration Solver
@@ -121,7 +121,7 @@ This step is unnecessary on every node, just one node is enough.
     "comm_profile_dir": "{comm profile dir}",
     "bucket_profile_dir": "{bucket profile dir}",
     "gpu_cluster_info": "{gpu cluster info file (JSON)}",
-    "available_servers": ["{node 1}", "{node 2}"]
+    "available_servers": ["{first node}", "{second node}"]
   }
   ```
   Example config file: ```iidp_config/example.json```
@@ -132,7 +132,7 @@ This step is unnecessary on every node, just one node is enough.
     "comm_profile_dir": "../common/comm_profile_data",
     "bucket_profile_dir": "bucket_profile_data",
     "gpu_cluster_info": "../common/cluster_config/example_cluster_info.json",
-    "available_servers": ["node1", "node2"]
+    "available_servers": ["node0", "node1"]
   }
   ```
 

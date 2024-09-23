@@ -1,15 +1,15 @@
 # How to run example on IIDP
 
 ## Common setup
-Assume the hardware setup of 2 GPU nodes.
+Take an example of the hardware setup of two GPU nodes.
 ```
-Hostname: node1
+Hostname: node0
 GPU: 4 x Tesla V100-PCIE-16GB (TFPLOS: 14.13)
 PCIe bandwidth: 15.75 GB/s
 InfiniBand (IB) bandwidth: 100Gbps
 ```
 ```
-Hostname: node2
+Hostname: node1
 GPU: 4 x Tesla P100-PCIE-16GB (TFPLOS: 9.52)
 PCIe bandwidth: 15.75 GB/s
 InfiniBand (IB) bandwidth: 100Gbps
@@ -24,7 +24,7 @@ InfiniBand (IB) bandwidth: 100Gbps
     ```
     Example configuration
     ```
-    export IIDP_MAIN_NODE=node1
+    export IIDP_MAIN_NODE=node0
     export IIDP_DATA_STORAGE=/mnt/dataset
     ```
 
@@ -45,14 +45,14 @@ InfiniBand (IB) bandwidth: 100Gbps
     The unit of ```intra_network_bandwidth``` and ```inter_network_bandwidth``` is 'Bytes per seconds'.
     ```json
     {
-        "node1": {
+        "node0": {
             "type": "Tesla V100-PCIE-16GB",
             "tfplos": 14.13,
             "number": 4,
             "intra_network_bandwidth": 15750000000,
             "inter_network_bandwidth": 12500000000
         },
-        "node2": {
+        "node1": {
             "type": "Tesla P100-PCIE-16GB",
             "tfplos": 9.52,
             "number": 4,
@@ -73,32 +73,32 @@ InfiniBand (IB) bandwidth: 100Gbps
 
     Intra-node
     ```
-    # node1 (main node)
+    # node0 (main node)
     cd $IIDP_HOME/examples/common
-    ./profiler/comm/scripts/get_comm_profile_data.sh 0 1 node1 15750000000 12500000000 comm_profile_data
+    ./profiler/comm/scripts/get_comm_profile_data.sh 0 1 node0 15750000000 12500000000 comm_profile_data
     ```
 
     Inter-node
     ```
-    # node1 (main node)
+    # node0 (main node)
     cd $IIDP_HOME/examples/common
-    ./profiler/comm/scripts/get_comm_profile_data.sh 0 2 node1 15750000000 12500000000 comm_profile_data
+    ./profiler/comm/scripts/get_comm_profile_data.sh 0 2 node0 15750000000 12500000000 comm_profile_data
 
-    # node2
+    # node1
     cd $IIDP_HOME/examples/common
-    ./profiler/comm/scripts/get_comm_profile_data.sh 1 2 node1 15750000000 12500000000 comm_profile_data
+    ./profiler/comm/scripts/get_comm_profile_data.sh 1 2 node0 15750000000 12500000000 comm_profile_data
     ```
 
-    Make sure that result on node1 exists at ```examples/common/comm_profile_data```
+    Make sure that result on node0 exists at ```examples/common/comm_profile_data```
     ```
     comm_profile_data/
         ├── inter_comm_profile_data.txt
         └── intra_comm_profile_data.txt
     ```
 
-   Send ```comm_profile_data/``` to ```node2``` so that result should be placed on node1 and node2
+   Send ```comm_profile_data/``` to ```node1``` so that result should be placed on node0 and node1
    ```
-   scp -r comm_profile_data node2:$IIDP_HOME/examples/common
+   scp -r comm_profile_data node1:$IIDP_HOME/examples/common
    ```
 
 ## PyTorch Examples

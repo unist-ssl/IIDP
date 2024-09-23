@@ -1,5 +1,6 @@
-# Faster-R-CNN
-The original code of this example comes from [vision/references/detection](https://github.com/pytorch/vision/tree/v0.9.1/references/detection)
+# ViT
+
+The original code of this example comes from [yitu-opensource/T2T-ViT](https://github.com/yitu-opensource/T2T-ViT)
 
 ## Table of Contents
 
@@ -19,14 +20,17 @@ The original code of this example comes from [vision/references/detection](https
 ## Prerequisites
 - Software packages
   ```bash
-  pip install -r requirements.txt
+  pip install -r requirements.txt --no-deps
   ```
-- MS-COCO 2017 dataset
+- ImageNet dataset
+  1) Download the ImageNet dataset from http://www.image-net.org/ to ```IIDP_DATA_STORAGE```.
+      - Two .tar files are downloaded: ```ILSVRC2012_img_train.tar``` and ```ILSVRC2012_img_val.tar```
+  2) Run the script to extract and make labeled folders.
 
-  Dataset is stored to ```IIDP_DATA_STORAGE/coco2017```.
-  ```bash
-  ./scripts/utils/prepare_dataset.sh
-  ```
+      Dataset is stored to ```IIDP_DATA_STORAGE/imagenet```.
+      ```bash
+      ./scripts/utils/prepare_dataset.sh
+      ```
 
 ## How to run on IIDP
 - Benchmark (throughput)
@@ -40,12 +44,13 @@ The original code of this example comes from [vision/references/detection](https
 - Example
   - node0
     ```
-    ./scripts/distributed/distributed_run.sh 0 2 2 3
+    ./scripts/distributed/distributed_run.sh 0 2 32 3
     ```
   - node1
     ```
-    ./scripts/distributed/distributed_run.sh 1 2 2 1
+    ./scripts/distributed/distributed_run.sh 1 2 32 1
     ```
+
 
 ## Configuration of IIDP
 We provide the configuration solver that finds the best configuration of IIDP with repect to 1) local batch size 2) the number of VSWs 3) gradient accumulation steps.
@@ -63,7 +68,7 @@ Generate memory profile data on each node.
 Example
 ```
 # On node0, node1
-./profiler/memory/scripts/run_mem_profiler.sh 1
+./profiler/memory/scripts/run_mem_profiler.sh 32
 ```
 
 ### 2. Computation Profiler
@@ -139,5 +144,5 @@ This step is unnecessary on every node, just one node is enough.
   ```
   Example
   ```bash
-  ./scripts/config/run_config_solver.sh iidp_config/example.json 32
+  ./scripts/config/run_config_solver.sh iidp_config/example.json 512
   ```

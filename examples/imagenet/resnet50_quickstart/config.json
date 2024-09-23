@@ -1,0 +1,8 @@
+{
+  "memory_profile_dir": "resnet50_quickstart/cluster_mem_profile_data",
+  "comp_profile_dir": "resnet50_quickstart/cluster_comp_profile_data",
+  "comm_profile_dir": "resnet50_quickstart/comm_profile_data",
+  "bucket_profile_dir": "resnet50_quickstart/bucket_profile_data",
+  "gpu_cluster_info": "resnet50_quickstart/cluster_info.json",
+  "available_servers": ["node0", "node1"]
+}

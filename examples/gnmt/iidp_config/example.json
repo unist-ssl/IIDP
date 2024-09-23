@@ -4,5 +4,5 @@
   "comm_profile_dir": "../common/comm_profile_data",
   "bucket_profile_dir": "bucket_profile_data",
   "gpu_cluster_info": "../common/cluster_config/example_cluster_info.json",
-  "available_servers": ["node1", "node2"]
+  "available_servers": ["node0", "node1"]
 }
