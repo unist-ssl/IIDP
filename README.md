@@ -6,7 +6,7 @@ In IIDP, each worker uses the same local batch size, but multiple workers called
 IIDP also allows these VSWs to execute multiple mini-batches via Gradient Accumulation (GA).
 Furthermore, IIDP employs an efficient synchronization mechanism among VSWs, that is, the local aggregation and weight update techniques.
 
-For more details, please refer to EuroSys '25 paper entitled **JABAS: Joint Adaptive Batching and Automatic Scaling for DNN Training on Heterogeneous GPUs** (link will be uploaded).
+For more details, please refer to EuroSys '25 paper entitled **JABAS: Joint Adaptive Batching and Automatic Scaling for DNN Training on Heterogeneous GPUs** [[link]](https://dl.acm.org/doi/10.1145/3689031.3696078).
 
 ## Getting Started
 ### Prerequisites
